@@ -35,7 +35,7 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", 1000.0))
 
 # For demonstration, we run the price-updating task every 60 seconds.
-PRICE_UPDATE_INTERVAL = int(os.getenv("PRICE_UPDATE_INTERVAL",60))
+PRICE_UPDATE_INTERVAL = int(os.getenv("PRICE_UPDATE_INTERVAL", 60))
 
 ENVIROMENT = os.getenv("ENVIROMENT", "development")
 
@@ -865,5 +865,5 @@ def main():
     bot.run(BOT_TOKEN)
 
 
-if __name__ "__main__":
+if __name__ == "__main__":  # Fixed: Added missing == operator
     main()
