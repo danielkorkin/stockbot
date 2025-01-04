@@ -1,0 +1,5 @@
+discord
+matplotlib
+motor
+pandas
+python-dotenv
