@@ -234,17 +234,48 @@ async def get_stock_news(ticker: str) -> List[Dict]:
         # Format the news items
         formatted_news = []
         for item in news[:5]:  # Get latest 5 news items
-            formatted_news.append(
-                {
-                    "title": item.get("title", "No title"),
-                    "publisher": item.get("publisher", "Unknown"),
-                    "link": item.get("link", ""),  # Change from "#" to empty string
-                    "published": datetime.datetime.fromtimestamp(
-                        item.get("providerPublishTime", 0)
-                    ),
-                    "summary": item.get("summary", "No summary available"),
-                }
+            # Ensure we have all required fields with proper defaults
+            title = item.get("title", "")
+            if not title:  # Try alternate field names
+                title = item.get("headline", "No title available")
+
+            publisher = item.get("publisher", "")
+            if not publisher:
+                publisher = item.get("source", "Unknown source")
+
+            link = item.get("link", "")
+            if not link:
+                link = item.get("url", "")
+
+            # Get timestamp and handle epoch time
+            timestamp = item.get("providerPublishTime", 0)
+            if not timestamp:
+                timestamp = item.get("datetime", 0)
+
+            # Convert timestamp to datetime
+            published = (
+                datetime.datetime.fromtimestamp(timestamp)
+                if timestamp
+                else datetime.datetime.utcnow()
             )
+
+            # Get summary, with fallbacks
+            summary = item.get("summary", "")
+            if not summary:
+                summary = item.get("text", "No summary available")
+
+            # Only add news items that have at least a title and link
+            if title and link:
+                formatted_news.append(
+                    {
+                        "title": title,
+                        "publisher": publisher,
+                        "link": link,
+                        "published": published,
+                        "summary": summary[:2000],  # Limit summary length
+                    }
+                )
+
         return formatted_news
     except Exception as e:
         print(f"Error getting news for {ticker}: {e}")
@@ -1329,7 +1360,7 @@ async def stock_chart_command(
     await interaction.followup.send(file=file, embed=embed)
 
 
-# Update the news command's embed_factory
+# Update the news command's embed factory
 @stock_group.command(name="news", description="Show latest news for a stock")
 @app_commands.describe(ticker="Ticker symbol")
 async def stock_news_command(interaction: discord.Interaction, ticker: str):
@@ -1346,23 +1377,23 @@ async def stock_news_command(interaction: discord.Interaction, ticker: str):
             title=f"{ticker.upper()} News ({page_idx + 1}/{total_pages})",
             description=news_item["title"],
             color=discord.Color.blue(),
+            url=news_item["link"],
+            timestamp=news_item["published"],  # Add timestamp to embed
         )
 
-        # Only set URL if it's valid
-        if news_item["link"]:
-            embed.url = news_item["link"]
+        if news_item["summary"]:
+            # Truncate summary if too long and add ellipsis
+            summary = news_item["summary"][:1000] + (
+                "..." if len(news_item["summary"]) > 1000 else ""
+            )
+            embed.add_field(
+                name="Summary",
+                value=summary,
+                inline=False,
+            )
 
-        embed.add_field(
-            name="Summary",
-            value=f"{news_item['summary'][:1000]}...",
-            inline=False,
-        )
-        embed.add_field(name="Publisher", value=news_item["publisher"], inline=True)
-        embed.add_field(
-            name="Published",
-            value=news_item["published"].strftime("%Y-%m-%d %H:%M UTC"),
-            inline=True,
-        )
+        if news_item["publisher"]:
+            embed.add_field(name="Source", value=news_item["publisher"], inline=True)
 
         return embed
 
