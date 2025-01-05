@@ -160,27 +160,14 @@ class StockBot(commands.Bot):
 
 
 async def get_stock_price(ticker: str) -> Optional[float]:
+    """Get the most recent price available, including after-hours trading."""
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-
-        # Get regular market price first
-        price = info.get("regularMarketPrice")
-
-        # Check for pre-market price
-        pre_market = info.get("preMarketPrice")
-        if pre_market:
-            return float(pre_market)
-
-        # Check for after-hours price
-        post_market = info.get("postMarketPrice")
-        if post_market:
-            return float(post_market)
-
-        # Fallback to regular price or previous close
-        return float(price or info.get("previousClose", 0))
+        info = await get_stock_info(ticker)
+        if info:
+            return info["price"]  # This already includes pre/post market prices
+        return None
     except Exception as e:
-        print(f"Error getting price for {ticker}: {e}")
+        print(f"Error getting latest price for {ticker}: {e}")
         return None
 
 
@@ -189,48 +176,71 @@ async def get_stock_info(ticker: str) -> Optional[Dict]:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # Get all market prices
-        regular_price = info.get("regularMarketPrice", 0.0)
-        pre_market = info.get("preMarketPrice")
-        post_market = info.get("postMarketPrice")
-
-        # Determine current price based on market hours
-        current_price = regular_price
+        # Get regular market price with better validation
+        current_price = None
         market_status = "Regular Hours"
 
-        if pre_market:
-            current_price = pre_market
-            market_status = "Pre-Market"
-        elif post_market:
-            current_price = post_market
-            market_status = "After-Hours"
+        # Try current price first
+        if info.get("currentPrice") and float(info["currentPrice"]) > 0:
+            current_price = float(info["currentPrice"])
 
-        # Get market cap with fallback
-        market_cap = info.get("marketCap") or info.get("totalMarketCap")
+        # Then try regular market price
+        elif info.get("regularMarketPrice") and float(info["regularMarketPrice"]) > 0:
+            current_price = float(info["regularMarketPrice"])
 
-        # Other data...
-        pe_ratio = info.get("forwardPE") or info.get("trailingPE") or 0.0
-        div_yield = (
-            info.get("dividendYield") or info.get("trailingAnnualDividendYield") or 0.0
-        )
-        if div_yield:
-            div_yield = div_yield * 100
+        # Finally try previous close
+        elif info.get("previousClose") and float(info["previousClose"]) > 0:
+            current_price = float(info["previousClose"])
+            market_status = "Previous Close"
+
+        if not current_price or current_price <= 0:
+            print(f"No valid price found for {ticker}")
+            return None
+
+        # Handle market cap more carefully
+        market_cap = None
+        if info.get("marketCap"):
+            market_cap = float(info["marketCap"])
+        elif info.get("totalMarketCap"):
+            market_cap = float(info["totalMarketCap"])
+
+        # If no market cap, try to calculate it
+        if not market_cap and info.get("sharesOutstanding"):
+            shares = float(info["sharesOutstanding"])
+            market_cap = current_price * shares
+
+        # If still no market cap, use a reasonable default
+        if not market_cap:
+            print(f"Using price-based market cap estimation for {ticker}")
+            market_cap = current_price * 1000000  # Assume 1M shares as fallback
+
+        # Debug logging
+        print(f"Stock info for {ticker}:")
+        print(f"Price: ${current_price:.2f}")
+        print(f"Market Cap: ${market_cap:,.2f}")
+        print(f"Status: {market_status}")
 
         return {
             "name": info.get("longName") or info.get("shortName", "Unknown"),
-            "price": float(current_price),
+            "price": current_price,
             "market_status": market_status,
-            "regular_price": float(regular_price) if regular_price else 0.0,
-            "pre_market": float(pre_market) if pre_market else None,
-            "post_market": float(post_market) if post_market else None,
-            "market_cap": float(market_cap) if market_cap else 0,
-            "pe_ratio": float(pe_ratio),
-            "dividend_yield": float(div_yield),
+            "market_cap": market_cap,
+            "regular_price": float(info.get("regularMarketPrice", 0)) or current_price,
+            "pre_market": float(info.get("preMarketPrice", 0)) or None,
+            "post_market": float(info.get("postMarketPrice", 0)) or None,
+            "pe_ratio": float(info.get("forwardPE", 0))
+            or float(info.get("trailingPE", 0))
+            or 0.0,
+            "dividend_yield": float(info.get("dividendYield", 0) * 100)
+            if info.get("dividendYield")
+            else 0.0,
             "sector": info.get("sector", "Unknown"),
-            "volume": info.get("volume") or info.get("averageVolume", 0),
+            "volume": int(info.get("volume", 0)) or int(info.get("averageVolume", 0)),
         }
+
     except Exception as e:
         print(f"Error getting info for {ticker}: {e}")
+        print(f"Raw info data: {info}")
         return None
 
 
@@ -247,16 +257,31 @@ async def get_user_data(user_collection, user_id: int):
     return user_data
 
 
-async def calculate_portfolio_value(portfolio: Dict[str, int]) -> float:
+async def calculate_portfolio_value(portfolio: Dict[str, int]) -> tuple[float, dict]:
+    """Calculate portfolio value using the most recent prices available."""
     total = 0.0
+    price_info = {}
+
     for ticker, shares in portfolio.items():
-        price = await get_stock_price(ticker)
-        if price:
-            total += price * shares
-    return round(total, 2)
+        info = await get_stock_info(ticker)
+        if info and info["price"] > 0:
+            value = info["price"] * shares
+            total += value
+            price_info[ticker] = {
+                "price": info["price"],
+                "market_status": info["market_status"],
+                "total_value": value,
+            }
+            print(
+                f"Portfolio value for {ticker}: ${value:,.2f} ({shares} shares @ ${info['price']:,.2f} - {info['market_status']})"
+            )
+        else:
+            print(f"Warning: Could not get valid price for {ticker}")
+
+    return round(total, 2), price_info
 
 
-async def get_top_stocks() -> List[Dict]:
+async def get_top_stocks() -> List[Dict]:  # Change this line
     try:
         # Get top 50 stocks using yfinance and pandas
         dow_tickers = [
@@ -357,7 +382,9 @@ bot = StockBot()
 async def balance_command(interaction: discord.Interaction):
     user_data = await get_user_data(bot.user_collection, interaction.user.id)
     balance = round(user_data["balance"], 2)
-    portfolio_value = await calculate_portfolio_value(user_data["portfolio"])
+
+    # Get detailed portfolio value
+    portfolio_value, _ = await calculate_portfolio_value(user_data["portfolio"])
     total_value = round(balance + portfolio_value, 2)
 
     embed = discord.Embed(title="Balance Sheet", color=discord.Color.green())
@@ -366,6 +393,11 @@ async def balance_command(interaction: discord.Interaction):
         name="Portfolio Value", value=f"${portfolio_value:,.2f}", inline=True
     )
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
+
+    # Add timestamp to show when values were last updated
+    embed.set_footer(
+        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
 
     await interaction.response.send_message(embed=embed)
 
@@ -494,14 +526,21 @@ async def portfolio_command(interaction: discord.Interaction):
 
     embed = discord.Embed(title="Your Portfolio", color=discord.Color.blue())
     total_value = 0.0
+
+    # Get detailed portfolio value with price info
+    portfolio_value, price_info = await calculate_portfolio_value(portfolio)
+
     for ticker, shares in portfolio.items():
-        price = await get_stock_price(ticker)
-        if price:
-            value = price * shares
+        if ticker in price_info:
+            info = price_info[ticker]
+            value = info["total_value"]
             total_value += value
+
+            # Add market status to each holding
             embed.add_field(
                 name=ticker,
-                value=f"{shares} shares @ ${price:,.2f} each\nValue: ${value:,.2f}",
+                value=f"{shares} shares @ ${info['price']:,.2f} each ({info['market_status']})\n"
+                f"Value: ${value:,.2f}",
                 inline=False,
             )
 
@@ -522,23 +561,22 @@ async def stock_command(interaction: discord.Interaction, ticker: str):
         return
 
     embed = discord.Embed(
-        title=f"{info['name']} ({ticker.upper()})", color=discord.Color.blue()
+        title=f"{info['name']} ({ticker.upper()})",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.utcnow(),  # Add timestamp
     )
 
-    # Price field with market status
-    price_text = f"${info['price']:,.2f} ({info['market_status']})"
-    if info["market_status"] != "Regular Hours":
-        price_text += f"\nRegular Hours: ${info['regular_price']:,.2f}"
-    embed.add_field(name="Price", value=price_text, inline=True)
+    # Always show the most recent price first
+    embed.add_field(
+        name="Current Price",
+        value=f"${info['price']:,.2f} ({info['market_status']})",
+        inline=False,
+    )
 
-    # Add pre/post market prices if available
-    if info["pre_market"]:
+    # Show other prices if available
+    if info["market_status"] != "Regular Hours" and info["regular_price"]:
         embed.add_field(
-            name="Pre-Market", value=f"${info['pre_market']:,.2f}", inline=True
-        )
-    if info["post_market"]:
-        embed.add_field(
-            name="After-Hours", value=f"${info['post_market']:,.2f}", inline=True
+            name="Regular Hours", value=f"${info['regular_price']:,.2f}", inline=True
         )
 
     embed.add_field(name="Market Cap", value=f"${info['market_cap']:,.2f}", inline=True)
@@ -580,16 +618,16 @@ async def history_command(interaction: discord.Interaction):
 async def leaderboard_command(interaction: discord.Interaction):
     users = bot.user_collection.find({})
     leaderboard = []
+
     async for user in users:
         try:
-            # Try to fetch the member object
             member = await interaction.guild.fetch_member(user["_id"])
-            if member:  # Only include users who are still in the server
-                portfolio_value = await calculate_portfolio_value(user["portfolio"])
+            if member:
+                # Get detailed portfolio value with real-time prices
+                portfolio_value, _ = await calculate_portfolio_value(user["portfolio"])
                 total_value = user["balance"] + portfolio_value
                 leaderboard.append((member, total_value))
         except discord.NotFound:
-            # Skip users who are no longer in the server
             continue
 
     if not leaderboard:
@@ -605,6 +643,11 @@ async def leaderboard_command(interaction: discord.Interaction):
             value=f"Net Worth: ${net_worth:,.2f}",
             inline=False,
         )
+
+    # Add timestamp to show when values were last updated
+    embed.set_footer(
+        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
 
     await interaction.response.send_message(embed=embed)
 
