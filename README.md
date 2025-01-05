@@ -1,40 +1,35 @@
-# Stock Bot - Discord Trading Simulator
+# Stock Bot - Real-Time Stock Trading Simulator
 
-A Discord bot that simulates stock market trading with virtual currency. Users can buy/sell stocks, track their portfolio, and compete on the leaderboard.
+A Discord bot that simulates stock trading using real-time market data from Yahoo Finance. Users can buy/sell stocks using virtual currency and track their portfolio performance.
 
 ## Features
 
-- **Trading**: Buy and sell stocks with virtual currency
+- **Real-Time Data**: Live stock prices including pre-market and after-hours trading
 - **Portfolio Management**: Track your holdings and net worth
-- **Market Overview**: View stocks by industry with current prices
-- **Price Charts**: Visual price history for each stock
-- **News & Events**: Events that affect stock prices
+- **Market Overview**: View top 50 stocks by market cap
+- **Price Charts**: Interactive price charts with multiple timeframes
+- **Transaction History**: Track all your trades
 - **Leaderboard**: Compete with other users
-- **Price Alerts**: Get notified when stocks hit target prices
 
 ## Commands
 
-### Basic Commands
-- `/balance` - Check your cash balance
-- `/portfolio` - View your stock holdings
-- `/market` - Browse available stocks by industry
-- `/leaderboard` - See top traders by net worth
-- `/stock <ticker>` - View detailed stock info
-- `/stock_chart <ticker> <timeframe>` - View price history chart
-
 ### Trading Commands
-- `/buy <ticker> <amount>` - Buy shares
-- `/sell <ticker> <amount>` - Sell shares
-- `/alert <ticker> <price>` - Set price alert
+- `/balance` - Check your cash balance and net worth
+- `/buy <ticker> <shares>` - Buy shares of a stock
+- `/sell <ticker> <shares>` - Sell shares of a stock
+- `/portfolio` - View your current stock holdings
 
-### Admin Commands (Owner Only)
-- `/create_stock` - Add new stock
-- `/update_stock` - Modify stock details
-- `/publish_event` - Create market-moving events
-- `/plateau` - Freeze stock price
-- `/set_target_price` - Gradually move stock to target price
+### Market Information
+- `/stock <ticker>` - View detailed stock info including pre/post market prices
+- `/chart <ticker> <period>` - View price chart with customizable timeframes
+  - Periods: 1min, 5min, 1h, 12h, 1d, 5d, 1mo, 1y, ytd, 5y, max
+- `/top` - Browse top 50 stocks by market cap (paginated)
 
-## Deployment Guide
+### User Stats
+- `/history` - View your transaction history
+- `/leaderboard` - See top traders by net worth
+
+## Setup Guide
 
 ### Prerequisites
 - Docker installed
