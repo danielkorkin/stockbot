@@ -225,56 +225,42 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
 
 # Update the get_stock_news function
 async def get_stock_news(ticker: str) -> List[Dict]:
+    """Get the latest news for a stock from Yahoo Finance."""
     try:
         stock = yf.Ticker(ticker)
-        news = stock.news
+        news = stock.news  # Access news directly as a property
         if not news:
             return []
 
-        # Format the news items
+        # Format the news items with proper field validation and timestamps
         formatted_news = []
         for item in news[:5]:  # Get latest 5 news items
-            # Ensure we have all required fields with proper defaults
-            title = item.get("title", "")
-            if not title:  # Try alternate field names
-                title = item.get("headline", "No title available")
+            # Validate required fields with defaults
+            title = item.get("title", "").strip()
+            if not title:
+                continue  # Skip items without titles
 
-            publisher = item.get("publisher", "")
-            if not publisher:
-                publisher = item.get("source", "Unknown source")
+            # Get summary and publisher with defaults
+            summary = item.get("summary", "").strip() or "No summary available"
+            publisher = item.get("publisher", "Yahoo Finance").strip()
 
-            link = item.get("link", "")
-            if not link:
-                link = item.get("url", "")
-
-            # Get timestamp and handle epoch time
+            # Convert timestamp to datetime with validation
             timestamp = item.get("providerPublishTime", 0)
-            if not timestamp:
-                timestamp = item.get("datetime", 0)
+            if timestamp:
+                published = datetime.datetime.fromtimestamp(timestamp)
+            else:
+                published = datetime.datetime.utcnow()  # Fallback to current time
 
-            # Convert timestamp to datetime
-            published = (
-                datetime.datetime.fromtimestamp(timestamp)
-                if timestamp
-                else datetime.datetime.utcnow()
+            # Add only if we have valid title
+            formatted_news.append(
+                {
+                    "title": title,
+                    "publisher": publisher,
+                    "link": item.get("link", ""),
+                    "published": published,
+                    "summary": summary,
+                }
             )
-
-            # Get summary, with fallbacks
-            summary = item.get("summary", "")
-            if not summary:
-                summary = item.get("text", "No summary available")
-
-            # Only add news items that have at least a title and link
-            if title and link:
-                formatted_news.append(
-                    {
-                        "title": title,
-                        "publisher": publisher,
-                        "link": link,
-                        "published": published,
-                        "summary": summary[:2000],  # Limit summary length
-                    }
-                )
 
         return formatted_news
     except Exception as e:
@@ -1855,10 +1841,8 @@ async def stock_today_command(interaction: discord.Interaction):
     """Show today's market status and trends"""
     await interaction.response.defer()
 
-    # Get all data concurrently
+    # Get market hours first to check if it's weekend
     market_hours = await get_market_hours()
-    indices = await get_major_indices()
-    movers = await get_top_movers(5)
 
     # Create embed
     embed = discord.Embed(
@@ -1867,6 +1851,62 @@ async def stock_today_command(interaction: discord.Interaction):
         color=discord.Color.blue(),
         timestamp=datetime.datetime.utcnow(),
     )
+
+    # If it's weekend, only show market hours
+    if "Weekend" in market_hours["status"]:
+        embed.add_field(
+            name="Trading Hours (ET)",
+            value=f"Pre-market: {market_hours['pre_market']}\n"
+            f"Regular: {market_hours['regular']}\n"
+            f"After-hours: {market_hours['after_hours']}",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    # Get market data for weekdays
+    indices = await get_major_indices()
+    movers = await get_top_movers(5)
+
+    # Add market performance section if we have data
+    sp500_data = indices.get("S&P 500", {})
+    dow_data = indices.get("Dow Jones", {})
+    nasdaq_data = indices.get("NASDAQ", {})
+
+    if sp500_data or dow_data or nasdaq_data:
+        market_summary = ""
+
+        if sp500_data:
+            change = sp500_data["change"]
+            pct = sp500_data["change_pct"]
+            emoji = "🟢" if change >= 0 else "🔴"
+            market_summary += (
+                f"{emoji} **S&P 500**: {sp500_data['price']:,.2f}\n"
+                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
+            )
+
+        if dow_data:
+            change = dow_data["change"]
+            pct = dow_data["change_pct"]
+            emoji = "🟢" if change >= 0 else "🔴"
+            market_summary += (
+                f"{emoji} **Dow Jones**: {dow_data['price']:,.2f}\n"
+                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
+            )
+
+        if nasdaq_data:
+            change = nasdaq_data["change"]
+            pct = nasdaq_data["change_pct"]
+            emoji = "🟢" if change >= 0 else "🔴"
+            market_summary += (
+                f"{emoji} **NASDAQ**: {nasdaq_data['price']:,.2f}\n"
+                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
+            )
+
+        if market_summary:
+            embed.add_field(
+                name="Market Performance", value=market_summary, inline=False
+            )
 
     # Add trading hours field
     embed.add_field(
@@ -1877,30 +1917,20 @@ async def stock_today_command(interaction: discord.Interaction):
         inline=False,
     )
 
-    # Add major indices
-    for name, data in indices.items():
-        color = "🟢" if data["change"] >= 0 else "🔴"
-        embed.add_field(
-            name=name,
-            value=f"{color} ${data['price']:,.2f}\n"
-            f"{data['change_pct']:+.2f}% "
-            f"(${data['change']:+,.2f})",
-            inline=True,
-        )
+    # Add gainers/losers only on weekdays and if we have data
+    if movers["gainers"]:
+        gainers_text = ""
+        for stock in movers["gainers"]:
+            gainers_text += f"**{stock['ticker']}**: +{stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
+        embed.add_field(name="Top Gainers", value=gainers_text, inline=False)
 
-    # Add top gainers
-    gainers_text = ""
-    for stock in movers["gainers"]:
-        gainers_text += f"**{stock['ticker']}**: +{stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
-    embed.add_field(name="Top Gainers", value=gainers_text or "No data", inline=False)
+    if movers["losers"]:
+        losers_text = ""
+        for stock in movers["losers"]:
+            losers_text += f"**{stock['ticker']}**: {stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
+        embed.add_field(name="Top Losers", value=losers_text, inline=False)
 
-    # Add top losers
-    losers_text = ""
-    for stock in movers["losers"]:
-        losers_text += f"**{stock['ticker']}**: {stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
-    embed.add_field(name="Top Losers", value=losers_text or "No data", inline=False)
-
-    # Add timestamp to show when values were last updated
+    # Add timestamp
     embed.set_footer(
         text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
