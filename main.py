@@ -128,8 +128,13 @@ class StockBot(commands.Bot):
             if ENVIRONMENT.lower() == "development":
                 self.tree.copy_global_to(guild=discord.Object(id=TEST_GUILD_ID))
                 await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+                print("Slash commands synced to test guild.")
             else:
+                # Clear the commands from test guild first
+                self.tree.clear_commands(guild=discord.Object(id=TEST_GUILD_ID))
+                # Then sync globally
                 await self.tree.sync()
+                print("Slash commands synced globally.")
         except Exception as e:
             print(f"Error syncing commands: {e}")
 
