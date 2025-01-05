@@ -193,14 +193,19 @@ class StockSimBot(commands.Bot):
         self.price_history_collection = None
 
     async def setup_hook(self):
-        # Sync slash commands
-        if ENVIRONMENT.lower() == "development":
-            self.tree.copy_global_to(guild=discord.Object(id=TEST_GUILD_ID))
-            await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
-            print("Slash commands synced to test guild.")
-        else:
-            await self.tree.sync()
-            print("Slash commands synced globally.")
+        try:
+            # Register slash commands based on environment
+            if ENVIRONMENT.lower() == "development":
+                # In development, only register to test guild
+                self.tree.copy_global_to(guild=discord.Object(id=TEST_GUILD_ID))
+                await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+                print("Slash commands synced to test guild.")
+            else:
+                # In production, register globally
+                await self.tree.sync()
+                print("Slash commands synced globally.")
+        except Exception as e:
+            print(f"Error syncing commands: {e}")
 
         # Setup Mongo
         self.motor_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
