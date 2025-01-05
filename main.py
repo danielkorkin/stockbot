@@ -560,15 +560,27 @@ async def leaderboard_command(interaction: discord.Interaction):
     users = bot.user_collection.find({})
     leaderboard = []
     async for user in users:
-        portfolio_value = await calculate_portfolio_value(user["portfolio"])
-        total_value = user["balance"] + portfolio_value
-        leaderboard.append((user["_id"], total_value))
+        try:
+            # Try to fetch the member object
+            member = await interaction.guild.fetch_member(user["_id"])
+            if member:  # Only include users who are still in the server
+                portfolio_value = await calculate_portfolio_value(user["portfolio"])
+                total_value = user["balance"] + portfolio_value
+                leaderboard.append((member, total_value))
+        except discord.NotFound:
+            # Skip users who are no longer in the server
+            continue
+
+    if not leaderboard:
+        await interaction.response.send_message("No users found.", ephemeral=True)
+        return
 
     leaderboard.sort(key=lambda x: x[1], reverse=True)
     embed = discord.Embed(title="Leaderboard", color=discord.Color.gold())
-    for rank, (user_id, net_worth) in enumerate(leaderboard[:10], start=1):
+
+    for rank, (member, net_worth) in enumerate(leaderboard[:10], start=1):
         embed.add_field(
-            name=f"{rank}. <@{user_id}>",
+            name=f"{rank}. {member.display_name}",
             value=f"Net Worth: ${net_worth:,.2f}",
             inline=False,
         )
