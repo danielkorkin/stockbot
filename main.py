@@ -644,48 +644,47 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
     try:
         stock = yf.Ticker(ticker)
 
+        # Update period and interval mappings for better short-term data
         period_map = {
-            "1min": "1d",  # 1 minute data for 1 day
-            "5min": "1d",  # 5 minute data for 1 day
-            "1h": "1d",  # 1 hour data for 1 day
-            "12h": "5d",  # hourly data for 5 days
-            "1d": "1d",  # daily data for 1 day
-            "5d": "5d",  # daily data for 5 days
-            "1mo": "1mo",  # daily data for 1 month
-            "1y": "1y",  # daily data for 1 year
-            "ytd": "ytd",  # daily data year to date
-            "5y": "5y",  # daily data for 5 years
-            "max": "max",  # all available data
+            "1mo": "1mo",
+            "3mo": "3mo",
+            "6mo": "6mo",
+            "1y": "1y",
+            "2y": "2y",
+            "5y": "5y",
+            "max": "max",
         }
 
         interval_map = {
-            "1min": "1m",
-            "5min": "5m",
-            "1h": "1h",
-            "12h": "1h",
-            "1d": "1m",  # Changed to 1m to get more detailed data
-            "5d": "1h",  # Changed to 1h for better resolution
-            "1mo": "1d",
-            "1y": "1d",
-            "ytd": "1d",
-            "5y": "1d",
-            "max": "1d",
+            "1mo": "1d",  # Daily data for 1 month
+            "3mo": "1d",  # Daily data for 3 months
+            "6mo": "1d",  # Daily data for 6 months
+            "1y": "1d",  # Daily data for 1 year
+            "2y": "1d",  # Daily data for 2 years
+            "5y": "1wk",  # Weekly data for 5 years
+            "max": "1mo",  # Monthly data for max period
         }
 
-        yf_period = period_map.get(period, "1d")
+        yf_period = period_map.get(period, "1mo")
         yf_interval = interval_map.get(period, "1d")
 
-        # Include pre/post market data
-        history = stock.history(
-            period=yf_period,
-            interval=yf_interval,
-            prepost=True,  # Include pre/post market data
+        print(
+            f"Fetching data for {ticker} with period: {yf_period}, interval: {yf_interval}"
         )
 
+        # Get historical data
+        history = stock.history(period=yf_period, interval=yf_interval, prepost=True)
+
         if history.empty:
+            print(f"No data returned for {ticker}")
             return None
 
+        # Print data info for debugging
+        print(f"Fetched {len(history)} data points")
+        print(f"Date range: {history.index[0]} to {history.index[-1]}")
+
         return history
+
     except Exception as e:
         print(f"Error getting history for {ticker}: {e}")
         return None
@@ -912,24 +911,25 @@ class PineStrategyView(discord.ui.View):
 
     async def execute_strategy(self, interaction: discord.Interaction):
         try:
-            # Get historical data with appropriate interval based on period
-            if self.period in ["1mo", "3mo", "6mo"]:
-                interval = "1d"
-            else:
-                interval = "1wk"
+            print(f"Starting strategy execution for {self.ticker} over {self.period}")
 
             history = await get_stock_history(self.ticker, self.period)
             if history is None or history.empty:
                 await interaction.followup.send(
-                    "Unable to fetch stock data.", ephemeral=True
+                    f"Unable to fetch sufficient stock data for {self.ticker} over {self.period}. "
+                    "Try a different time period.",
+                    ephemeral=True,
                 )
                 return
+
+            print(f"Got {len(history)} historical data points")
 
             # Process strategy
             signals = await self.process_pine_strategy(history)
             if signals is None:
                 await interaction.followup.send(
-                    "Error processing strategy.", ephemeral=True
+                    "Unable to generate trading signals. Ensure you have sufficient data points.",
+                    ephemeral=True,
                 )
                 return
 
@@ -977,6 +977,15 @@ class PineStrategyView(discord.ui.View):
     async def process_pine_strategy(self, history: pd.DataFrame) -> pd.DataFrame:
         try:
             df = history.copy()
+
+            # Ensure we have enough data points for meaningful analysis
+            min_required_points = 30  # At least 30 data points for reliable signals
+            if len(df) < min_required_points:
+                print(f"Insufficient data points: {len(df)} < {min_required_points}")
+                return None
+
+            # Rest of the existing process_pine_strategy code...
+            # ...existing code...
 
             # Ensure Close column exists and has valid data
             if "Close" not in df.columns or df["Close"].empty:
