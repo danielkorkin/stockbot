@@ -9,6 +9,7 @@ import os
 import re
 from typing import Dict, List, Optional
 
+import aiohttp  # Add this to the imports at the top
 import discord
 import matplotlib.pyplot as plt
 import motor.motor_asyncio
@@ -1207,11 +1208,63 @@ class PineStrategyView(discord.ui.View):
         return round(current_amount, 2), round(percent_gain, 2)
 
 
+async def fetch_algorithm_code(url: str) -> Optional[str]:
+    """Fetch and validate algorithm code from URL."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Add headers to mimic a browser request
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+
+                # Get content type and try to handle various formats
+                content_type = response.headers.get("content-type", "").lower()
+
+                # Allow more content types that might contain raw code
+                valid_content_types = [
+                    "text/plain",
+                    "text/markdown",
+                    "application/x-httpd-php",
+                    "text/html",
+                    "application/octet-stream",  # GitHub raw files sometimes use this
+                ]
+
+                # Special handling for GitHub raw URLs
+                if "githubusercontent.com" in url:
+                    content = await response.text()
+                    return content if content.strip() else None
+
+                # Check if content type is acceptable
+                if not any(t in content_type for t in valid_content_types):
+                    return None
+
+                content = await response.text()
+
+                # Basic validation of content
+                if not content.strip():
+                    return None
+
+                # Check if content looks like code (contains specific keywords)
+                code_indicators = ["//@version=", "indicator(", "strategy(", "study("]
+                if not any(indicator in content for indicator in code_indicators):
+                    return None
+
+                return content
+
+    except Exception as e:
+        print(f"Error fetching algorithm code: {e}")
+        return None
+
+
 @bot.tree.command(name="strategy", description="Test a Pine trading strategy")
 @app_commands.describe(
     ticker="Stock ticker symbol",
     period="Time period for backtest",
     initial_amount="Initial investment amount",
+    algorithm_url="Optional: URL to raw algorithm code (e.g., GitHub raw link)",
 )
 @app_commands.choices(
     period=[
@@ -1220,12 +1273,40 @@ class PineStrategyView(discord.ui.View):
     ]
 )
 async def strategy_command(
-    interaction: discord.Interaction, ticker: str, period: str, initial_amount: float
+    interaction: discord.Interaction,
+    ticker: str,
+    period: str,
+    initial_amount: float,
+    algorithm_url: str = None,
 ):
     view = PineStrategyView(ticker.upper(), period, initial_amount)
-    modal = PineStrategyModal()
-    modal.view = view
-    await interaction.response.send_modal(modal)
+
+    if algorithm_url:
+        # Verify URL format
+        if not algorithm_url.startswith(("http://", "https://")):
+            await interaction.response.send_message(
+                "Invalid URL format. Please provide a valid HTTP(S) URL.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        algorithm_code = await fetch_algorithm_code(algorithm_url)
+        if algorithm_code is None:
+            await interaction.followup.send(
+                "Failed to fetch valid algorithm code. Please ensure the URL points to a raw Pine script.",
+                ephemeral=True,
+            )
+            return
+
+        view.pine_code = algorithm_code
+        await view.execute_strategy(interaction)
+    else:
+        # Show the modal for manual code input
+        modal = PineStrategyModal()
+        modal.view = view
+        await interaction.response.send_modal(modal)
 
 
 def main():
