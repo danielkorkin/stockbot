@@ -839,6 +839,34 @@ async def news_command(interaction: discord.Interaction, ticker: str):
     await view.send_first_page(interaction.followup, is_followup=True)
 
 
+@bot.tree.command(name="resync", description="Resync all slash commands (Owner Only)")
+async def resync_command(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    try:
+        if ENVIRONMENT.lower() == "development":
+            bot.tree.copy_global_to(guild=discord.Object(id=TEST_GUILD_ID))
+            await bot.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+            await interaction.followup.send(
+                "Slash commands resynced to test guild successfully."
+            )
+        else:
+            await bot.tree.sync()
+            await interaction.followup.send(
+                "Slash commands resynced globally successfully."
+            )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error resyncing commands: {str(e)}", ephemeral=True
+        )
+
+
 def main():
     bot.run(BOT_TOKEN)
 
