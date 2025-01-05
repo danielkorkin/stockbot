@@ -2744,7 +2744,9 @@ async def balance_command(
     embed.add_field(
         name="Stock Portfolio", value=f"${portfolio_value:,.2f}", inline=True
     )
-    embed.add_field(name="Crypto Portfolio", value=f"${crypto_value:,.2f}", inline=True)
+    embed.add_field(
+        name="Crypto Portfolio", value=format_crypto_price(crypto_value), inline=True
+    )
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
 
     # Add timestamp to show when values were last updated
@@ -2916,17 +2918,17 @@ async def portfolio_command(
                 embed.add_field(
                     name=f"Crypto: {item['ticker']}",
                     value=f"{item['amount']} tokens @ {format_crypto_price(item['price_info']['price'])} each\n"
-                    f"Value: ${value:,.2f}",
+                    f"Value: {format_crypto_price(value)}",
                     inline=False,
                 )
 
         total_assets = portfolio_value + crypto_value
         embed.add_field(
             name="Portfolio Summary",
-            value=f"Page Total: ${page_total:,.2f}\n"
+            value=f"Page Total: {format_crypto_price(page_total)}\n"
             f"Stocks Value: ${portfolio_value:,.2f}\n"
-            f"Crypto Value: ${crypto_value:,.2f}\n"
-            f"Total Assets: ${total_assets:,.2f}\n"
+            f"Crypto Value: {format_crypto_price(crypto_value)}\n"
+            f"Total Assets: {format_crypto_price(total_assets)}\n"
             f"Cash Balance: ${user_data['balance']:,.2f}\n"
             f"Net Worth: ${(total_assets + user_data['balance']):,.2f}",
             inline=False,
@@ -2988,10 +2990,10 @@ async def sell_all_command(interaction: discord.Interaction):
     embed.add_field(
         name="Portfolio Summary",
         value=f"Stocks Value: ${portfolio_value:,.2f}\n"
-        f"Crypto Value: ${crypto_value:,.2f}\n"
-        f"Total Sale Value: ${total_value:,.2f}\n"
+        f"Crypto Value: {format_crypto_price(crypto_value)}\n"
+        f"Total Sale Value: {format_crypto_price(total_value)}\n"
         f"Current Balance: ${user_data['balance']:,.2f}\n"
-        f"Balance After Sale: ${(user_data['balance'] + total_value):,.2f}",
+        f"Balance After Sale: {format_crypto_price(user_data['balance'] + total_value)}",
         inline=False,
     )
 
