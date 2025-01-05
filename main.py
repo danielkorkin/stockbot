@@ -1068,6 +1068,117 @@ async def reset_single_ticker_command(interaction: discord.Interaction, ticker: 
     )
 
 
+@bot.tree.command(name="alert", description="Set a price alert for a stock")
+@app_commands.describe(
+    ticker="Ticker symbol", target_price="Price at which you want to be alerted"
+)
+async def alert_command(
+    interaction: discord.Interaction, ticker: str, target_price: float
+):
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message("Stock not found.", ephemeral=True)
+        return
+
+    alert_doc = {
+        "user_id": interaction.user.id,
+        "channel_id": interaction.channel_id,
+        "ticker": ticker.upper(),
+        "target_price": target_price,
+    }
+    await bot.alerts_collection.insert_one(alert_doc)
+
+    await interaction.response.send_message(
+        f"Alert set: {ticker.upper()} @ ${target_price:.2f}\n"
+        f"I'll ping you here when this threshold is reached."
+    )
+
+
+@bot.tree.command(
+    name="plateau", description="Toggle plateau (freeze) for a stock (Owner Only)"
+)
+@app_commands.describe(ticker="Which stock to freeze/unfreeze", toggle="on or off")
+async def plateau_command(
+    interaction: discord.Interaction, ticker: str, toggle: Literal["on", "off"]
+):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message("Stock not found.", ephemeral=True)
+        return
+
+    new_val = toggle == "on"
+    await bot.stock_collection.update_one(
+        {"_id": ticker.upper()}, {"$set": {"plateau": new_val, "reset_ignore": False}}
+    )
+
+    msg = (
+        f"Stock {ticker.upper()} is now plateaued (frozen)."
+        if new_val
+        else f"Stock {ticker.upper()} is no longer plateaued."
+    )
+    await interaction.response.send_message(msg)
+
+
+@bot.tree.command(
+    name="set_target_price",
+    description="Gradually move stock price to target (Owner Only)",
+)
+@app_commands.describe(
+    ticker="Which stock",
+    target_price="Desired final price",
+    duration_minutes="Minutes until price reaches target",
+)
+async def set_target_price_command(
+    interaction: discord.Interaction,
+    ticker: str,
+    target_price: float,
+    duration_minutes: int,
+):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "Only the bot owner can use this command.", ephemeral=True
+        )
+        return
+
+    if duration_minutes <= 0:
+        await interaction.response.send_message(
+            "Duration must be positive.", ephemeral=True
+        )
+        return
+
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message("Stock not found.", ephemeral=True)
+        return
+
+    current_price = stock_doc["price"]
+    start_time = datetime.datetime.utcnow()
+    finish_time = start_time + datetime.timedelta(minutes=duration_minutes)
+
+    target_price_info = {
+        "target_price": round(target_price, 2),
+        "start_time": start_time,
+        "finish_time": finish_time,
+        "start_price": current_price,
+    }
+
+    await bot.stock_collection.update_one(
+        {"_id": ticker.upper()},
+        {"$set": {"target_price_info": target_price_info, "reset_ignore": False}},
+    )
+
+    await interaction.response.send_message(
+        f"Over the next {duration_minutes} minute(s), {ticker.upper()} will move from "
+        f"${current_price:.2f} to ${target_price:.2f}."
+    )
+
+
 ######################
 # BOT run
 ######################
