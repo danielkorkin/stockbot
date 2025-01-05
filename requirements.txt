@@ -4,3 +4,4 @@ motor
 pandas
 python-dotenv
 yfinance
+pandas_ta

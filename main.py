@@ -1,16 +1,23 @@
+import ast
 import asyncio
 import datetime
 import io
 import math
 import os
+
+# Replace pynescript import with re
+import re
 from typing import Dict, List, Optional
 
 import discord
 import matplotlib.pyplot as plt
 import motor.motor_asyncio
 import pandas as pd
+import pandas_ta as ta  # Add to requirements.txt
 import yfinance as yf
-from discord import app_commands
+
+# Add these imports at the top
+from discord import TextStyle, app_commands, ui
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -870,6 +877,303 @@ async def resync_command(interaction: discord.Interaction):
         await interaction.followup.send(
             f"Error resyncing commands: {str(e)}", ephemeral=True
         )
+
+
+class PineStrategyModal(ui.Modal, title="Pine Strategy Input"):
+    pine_code = ui.TextInput(
+        label="Pine Strategy Code",
+        style=TextStyle.paragraph,
+        placeholder="Paste your Pine strategy code here...",
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await self.process_strategy(interaction)
+
+    async def process_strategy(self, interaction: discord.Interaction):
+        try:
+            # Store the code for access in the callback
+            self.view.pine_code = self.pine_code.value
+            await self.view.execute_strategy(interaction)
+        except Exception as e:
+            await interaction.followup.send(
+                f"Error processing strategy: {str(e)}", ephemeral=True
+            )
+
+
+class PineStrategyView(discord.ui.View):
+    def __init__(self, ticker: str, period: str, initial_amount: float):
+        super().__init__()
+        self.ticker = ticker
+        self.period = period
+        self.initial_amount = initial_amount
+        self.pine_code = None
+
+    async def execute_strategy(self, interaction: discord.Interaction):
+        try:
+            # Get historical data with appropriate interval based on period
+            if self.period in ["1mo", "3mo", "6mo"]:
+                interval = "1d"
+            else:
+                interval = "1wk"
+
+            history = await get_stock_history(self.ticker, self.period)
+            if history is None or history.empty:
+                await interaction.followup.send(
+                    "Unable to fetch stock data.", ephemeral=True
+                )
+                return
+
+            # Process strategy
+            signals = await self.process_pine_strategy(history)
+            if signals is None:
+                await interaction.followup.send(
+                    "Error processing strategy.", ephemeral=True
+                )
+                return
+
+            # Calculate returns and generate chart
+            final_amount, percent_gain = self.calculate_returns(history, signals)
+            buf = await self.create_strategy_chart(history, signals)
+
+            # Create detailed embed
+            embed = discord.Embed(
+                title=f"Strategy Test Results for {self.ticker}",
+                color=discord.Color.blue(),
+            )
+
+            # Summary stats
+            embed.add_field(
+                name="Initial Investment",
+                value=f"${self.initial_amount:,.2f}",
+                inline=True,
+            )
+            embed.add_field(
+                name="Final Amount", value=f"${final_amount:,.2f}", inline=True
+            )
+            embed.add_field(
+                name="Total Return", value=f"{percent_gain:,.2f}%", inline=True
+            )
+
+            # Trading stats
+            buy_signals = len(signals[signals["buy_signal"]].index)
+            sell_signals = len(signals[signals["sell_signal"]].index)
+            embed.add_field(name="Buy Signals", value=str(buy_signals), inline=True)
+            embed.add_field(name="Sell Signals", value=str(sell_signals), inline=True)
+            embed.add_field(name="Period", value=self.period, inline=True)
+
+            # Send results
+            file = discord.File(buf, filename="strategy_chart.png")
+            embed.set_image(url="attachment://strategy_chart.png")
+            await interaction.followup.send(embed=embed, file=file)
+
+        except Exception as e:
+            print(f"Strategy execution error: {e}")
+            await interaction.followup.send(
+                f"Error executing strategy: {str(e)}", ephemeral=True
+            )
+
+    async def process_pine_strategy(self, history: pd.DataFrame) -> pd.DataFrame:
+        try:
+            df = history.copy()
+
+            # Ensure Close column exists and has valid data
+            if "Close" not in df.columns or df["Close"].empty:
+                print("No valid price data found")
+                return None
+
+            # Convert Close prices to numeric and handle NaN values
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df["Close"] = df["Close"].ffill().bfill()
+
+            # Debug log
+            print(f"Data shape: {df.shape}")
+            print(f"Close price range: {df['Close'].min()} - {df['Close'].max()}")
+            print(f"Sample of Close prices: {df['Close'].head()}")
+
+            # Extract MA length
+            ma_length_match = re.search(
+                r"maLength\s*=\s*input\.int\s*\(\s*(\d+)", self.pine_code
+            )
+            ma_length = int(ma_length_match.group(1)) if ma_length_match else 14
+            print(f"Using MA length: {ma_length}")
+
+            # Calculate Moving Average with fallback options
+            try:
+                # Try pandas_ta first
+                ma_series = ta.sma(df["Close"], length=ma_length)
+
+                # If pandas_ta fails, use pandas rolling mean
+                if (
+                    ma_series is None
+                    or isinstance(ma_series, pd.DataFrame)
+                    and ma_series.empty
+                ):
+                    print("Falling back to pandas rolling mean")
+                    ma_series = (
+                        df["Close"].rolling(window=ma_length, min_periods=1).mean()
+                    )
+
+                # Convert to pandas Series if needed
+                if isinstance(ma_series, pd.DataFrame):
+                    ma_series = ma_series.iloc[:, 0]
+
+                # Handle NaN values in MA
+                df["ma"] = ma_series
+                df["ma"] = df["ma"].ffill().bfill()
+
+                print(f"MA calculation successful")
+                print(f"MA range: {df['ma'].min()} - {df['ma'].max()}")
+                print(f"Sample of MA values: {df['ma'].head()}")
+
+            except Exception as e:
+                print(f"Error in MA calculation: {e}")
+                print(f"Data types - Close: {df['Close'].dtype}")
+                return None
+
+            # Additional validation
+            if df["ma"].isna().any():
+                print("Warning: MA contains NaN values after calculation")
+                df["ma"] = df["ma"].ffill().bfill()
+
+            # Generate signals with validation
+            df["buy_signal"] = False
+            df["sell_signal"] = False
+
+            valid_mask = df["Close"].notna() & df["ma"].notna()
+            if not valid_mask.any():
+                print("No valid data points for signal generation")
+                return None
+
+            # Calculate signals on valid data only
+            df.loc[valid_mask, "buy_signal"] = (df["Close"] > df["ma"]) & (
+                df["Close"].shift(1) <= df["ma"].shift(1)
+            )
+
+            df.loc[valid_mask, "sell_signal"] = (df["Close"] < df["ma"]) & (
+                df["Close"].shift(1) >= df["ma"].shift(1)
+            )
+
+            print(
+                f"Signal generation complete. Buy signals: {df['buy_signal'].sum()}, Sell signals: {df['sell_signal'].sum()}"
+            )
+            return df
+
+        except Exception as e:
+            print(f"Error processing Pine strategy: {e}")
+            return None
+
+    async def create_strategy_chart(
+        self, history: pd.DataFrame, signals: pd.DataFrame
+    ) -> io.BytesIO:
+        plt.figure(figsize=(12, 6))
+
+        # Plot price and MA
+        plt.plot(
+            history.index, history["Close"], label="Price", color="blue", alpha=0.8
+        )
+        plt.plot(history.index, signals["ma"], label="MA", color="orange", alpha=0.6)
+
+        # Plot buy/sell signals
+        buy_points = signals[signals["buy_signal"]].index
+        sell_points = signals[signals["sell_signal"]].index
+
+        if not buy_points.empty:
+            plt.scatter(
+                buy_points,
+                signals.loc[buy_points, "Close"],
+                color="green",
+                marker="^",
+                s=100,
+                label="Buy Signal",
+            )
+        if not sell_points.empty:
+            plt.scatter(
+                sell_points,
+                signals.loc[sell_points, "Close"],
+                color="red",
+                marker="v",
+                s=100,
+                label="Sell Signal",
+            )
+
+        plt.title(f"{self.ticker} Strategy Backtest - {self.period}")
+        plt.xlabel("Date")
+        plt.ylabel("Price (USD)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        # Format date axis
+        plt.gcf().autofmt_xdate()  # Rotate and align the tick labels
+
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=100)
+        buf.seek(0)
+        plt.close()
+
+        return buf
+
+    def calculate_returns(
+        self, history: pd.DataFrame, signals: pd.DataFrame
+    ) -> tuple[float, float]:
+        current_amount = self.initial_amount
+        current_shares = 0
+        trades = []
+
+        for i in range(len(signals)):
+            price = signals["Close"].iloc[i]
+
+            # Buy signal
+            if signals["buy_signal"].iloc[i] and current_shares == 0:
+                current_shares = current_amount / price
+                current_amount = 0
+                trades.append(("BUY", price, current_shares))
+
+            # Sell signal
+            elif signals["sell_signal"].iloc[i] and current_shares > 0:
+                current_amount = current_shares * price
+                current_shares = 0
+                trades.append(("SELL", price, current_amount))
+
+        # Close any remaining position
+        if current_shares > 0:
+            current_amount = current_shares * signals["Close"].iloc[-1]
+            trades.append(("FINAL", signals["Close"].iloc[-1], current_amount))
+
+        percent_gain = (
+            (current_amount - self.initial_amount) / self.initial_amount
+        ) * 100
+
+        # Print trades for debugging
+        print(f"Strategy Trades for {self.ticker}:")
+        for trade_type, price, amount in trades:
+            print(f"{trade_type}: Price=${price:.2f}, Amount=${amount:.2f}")
+
+        return round(current_amount, 2), round(percent_gain, 2)
+
+
+@bot.tree.command(name="strategy", description="Test a Pine trading strategy")
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    period="Time period for backtest",
+    initial_amount="Initial investment amount",
+)
+@app_commands.choices(
+    period=[
+        app_commands.Choice(name=p, value=p)
+        for p in ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
+    ]
+)
+async def strategy_command(
+    interaction: discord.Interaction, ticker: str, period: str, initial_amount: float
+):
+    view = PineStrategyView(ticker.upper(), period, initial_amount)
+    modal = PineStrategyModal()
+    modal.view = view
+    await interaction.response.send_modal(modal)
 
 
 def main():
