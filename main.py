@@ -4,7 +4,7 @@ import io
 import math
 import os
 import random
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 import discord
 import matplotlib.dates as mdates
@@ -101,7 +101,8 @@ class PaginatorView(discord.ui.View):
         """
         :param items: The full list of items to paginate
         :param items_per_page: Number of items displayed per page
-        :param embed_factory: A callable that receives (current_page, total_pages, items_for_this_page) -> discord.Embed
+                            (commonly 1 if each item is an entire chunk to show)
+        :param embed_factory: A callable (page_index, total_pages, items_for_page) -> discord.Embed
         :param author_id: The user ID of the person who invoked the command
         :param max_pages: If set, limit total pages to this number
         """
@@ -369,7 +370,6 @@ async def leaderboard_command(interaction: discord.Interaction):
 
     # sort desc
     leaderboard_data.sort(key=lambda x: x[1], reverse=True)
-    # We'll let the view handle at most 10 pages, 5 per page => up to 50 users max
 
     def leaderboard_embed_factory(
         page_index: int, total_pages: int, items_for_page: list
@@ -401,46 +401,80 @@ async def leaderboard_command(interaction: discord.Interaction):
 
 
 ################################
-# PAGINATED /MARKET (5 stocks per page, unlimited pages)
+# PAGINATED /MARKET (1 industry per page)
 ################################
 @bot.tree.command(
-    name="market", description="Show all stocks, 5 per page, grouped here."
+    name="market", description="Show the market by industry, one page per industry."
 )
 async def market_command(interaction: discord.Interaction):
+    """
+    Displays each industry on its own page, listing all stocks in that industry.
+    """
+    # 1) Gather all stocks, group by industry.
     cursor = bot.stock_collection.find({})
-    market_data = []
+    industries_map: Dict[
+        str, List[dict]
+    ] = {}  # { industry: [ {ticker, price}, ...], ... }
+
     async for doc in cursor:
         industry = doc["industry"]
         ticker = doc["_id"]
         price = doc["price"]
-        market_data.append((industry, ticker, price))
+        if industry not in industries_map:
+            industries_map[industry] = []
+        industries_map[industry].append({"ticker": ticker, "price": price})
+
+    # 2) Convert into a sorted list of (industry, list_of_stocks)
+    #    so each item is 1 "page".
+    #    stocks are sorted by ticker ascending, or however you like.
+    pages = []
+    for industry, stocks_in_industry in industries_map.items():
+        stocks_in_industry.sort(key=lambda x: x["ticker"])  # sort by ticker
+        pages.append((industry, stocks_in_industry))
+
+    # Sort the pages by industry name (alphabetical) if you prefer:
+    pages.sort(key=lambda x: x[0])
+
+    if not pages:
+        await interaction.response.send_message("No stocks found.")
+        return
 
     def market_embed_factory(
         page_index: int, total_pages: int, items_for_page: list
     ) -> discord.Embed:
+        """
+        items_for_page will contain exactly 1 item in this scenario if we set items_per_page=1.
+        Because each 'item' is (industry, [ {ticker, price}, ... ])
+        """
+        (industry, stock_list) = items_for_page[0]  # there's only 1 item in the subset
+
         embed = discord.Embed(
             title=f"Market Overview - Page {page_index+1}/{total_pages}",
-            description="All available stocks (5 per page).",
+            description=f"Industry: **{industry}**",
             color=discord.Color.blue(),
         )
-        lines = []
-        for industry, ticker, price in items_for_page:
-            lines.append(f"**{ticker}** - ${price:.2f} ({industry})")
 
-        embed.add_field(
-            name="Stocks",
-            value="\n".join(lines) if lines else "No stocks here.",
-            inline=False,
-        )
+        lines = []
+        for stock_info in stock_list:
+            tkr = stock_info["ticker"]
+            p = stock_info["price"]
+            lines.append(f"**{tkr}** - ${p:.2f}")
+
+        if lines:
+            embed.add_field(
+                name="Stocks in this Industry", value="\n".join(lines), inline=False
+            )
+        else:
+            embed.add_field(
+                name="Stocks in this Industry", value="No stocks here.", inline=False
+            )
+
         return embed
 
-    if not market_data:
-        await interaction.response.send_message("No stocks found.")
-        return
-
+    # We want 1 industry per page => items_per_page=1
     view = PaginatorView(
-        items=market_data,
-        items_per_page=5,
+        items=pages,
+        items_per_page=1,
         embed_factory=market_embed_factory,
         author_id=interaction.user.id,
         max_pages=None,
