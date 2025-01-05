@@ -2755,6 +2755,254 @@ async def balance_command(
     await interaction.response.send_message(embed=embed)
 
 
+class SellAllConfirmationView(discord.ui.View):
+    def __init__(self, user_data: dict, total_value: float, portfolio_details: str):
+        super().__init__()
+        self.user_data = user_data
+        self.total_value = total_value
+        self.portfolio_details = portfolio_details
+
+    @discord.ui.button(label="I Confirm", style=discord.ButtonStyle.danger)
+    async def confirm_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = SellAllConfirmModal(self.user_data, self.total_value)
+        await interaction.response.send_modal(modal)
+
+
+class SellAllConfirmModal(discord.ui.Modal, title="Confirm Sell All"):
+    confirmation = discord.ui.TextInput(
+        label="Type 'CONFIRM' to sell everything", placeholder="CONFIRM", required=True
+    )
+
+    def __init__(self, user_data: dict, total_value: float):
+        super().__init__()
+        self.user_data = user_data
+        self.total_value = total_value
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirmation.value != "CONFIRM":
+            await interaction.response.send_message(
+                "Sell all cancelled - incorrect confirmation.", ephemeral=True
+            )
+            return
+
+        # Execute sell all
+        new_balance = self.user_data["balance"] + self.total_value
+
+        # Create transaction records
+        transactions = []
+        # Add stock transactions
+        for ticker, shares in self.user_data["portfolio"].items():
+            price = (await get_stock_price(ticker)) or 0
+            transactions.append(
+                {
+                    "type": "sell",
+                    "ticker": ticker,
+                    "shares": shares,
+                    "price": price,
+                    "total": price * shares,
+                    "timestamp": datetime.datetime.utcnow(),
+                }
+            )
+
+        # Add crypto transactions
+        for ticker, amount in self.user_data.get("crypto", {}).items():
+            price = (await get_crypto_price(ticker)) or 0
+            transactions.append(
+                {
+                    "type": "crypto_sell",
+                    "ticker": ticker,
+                    "amount": amount,
+                    "price": price,
+                    "total": price * amount,
+                    "timestamp": datetime.datetime.utcnow(),
+                }
+            )
+
+        # Update database
+        await bot.user_collection.update_one(
+            {"_id": interaction.user.id},
+            {
+                "$set": {"balance": new_balance, "portfolio": {}, "crypto": {}},
+                "$push": {"transactions": {"$each": transactions}},
+            },
+        )
+
+        embed = discord.Embed(
+            title="Portfolio Liquidated",
+            description="All stocks and cryptocurrencies have been sold.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(
+            name="Total Value Received", value=f"${self.total_value:,.2f}", inline=True
+        )
+        embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+        await interaction.response.send_message(embed=embed)
+
+
+# Remove the existing portfolio command from stock_group and add as root command
+@bot.tree.command(
+    name="portfolio",
+    description="Show your complete portfolio including stocks and crypto",
+)
+@app_commands.describe(user="Optional: View another user's portfolio")
+async def portfolio_command(
+    interaction: discord.Interaction, user: discord.Member = None
+):
+    """View complete portfolio with pagination"""
+    target_user = user or interaction.user
+    user_data = await get_user_data(bot.user_collection, target_user.id)
+
+    if not user_data["portfolio"] and not user_data.get("crypto", {}):
+        message = (
+            "Your portfolio is empty."
+            if user is None
+            else f"{target_user.display_name}'s portfolio is empty."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
+        user_data["portfolio"], user_data.get("crypto", {})
+    )
+
+    # Combine stocks and crypto into one list for pagination
+    portfolio_items = []
+
+    # Add stocks
+    for ticker, shares in user_data["portfolio"].items():
+        if ticker in price_info:
+            portfolio_items.append(
+                {
+                    "type": "stock",
+                    "ticker": ticker,
+                    "amount": shares,
+                    "price_info": price_info[ticker],
+                }
+            )
+
+    # Add crypto
+    for ticker, amount in user_data.get("crypto", {}).items():
+        if f"{ticker}-USD" in price_info:
+            portfolio_items.append(
+                {
+                    "type": "crypto",
+                    "ticker": ticker,
+                    "amount": amount,
+                    "price_info": price_info[f"{ticker}-USD"],
+                }
+            )
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Portfolio - {target_user.display_name}", color=discord.Color.blue()
+        )
+
+        page_total = 0.0
+        for item in subset:
+            value = item["price_info"]["total_value"]
+            page_total += value
+
+            if item["type"] == "stock":
+                embed.add_field(
+                    name=f"Stock: {item['ticker']}",
+                    value=f"{item['amount']} shares @ ${item['price_info']['price']:,.2f} each\n"
+                    f"Value: ${value:,.2f}",
+                    inline=False,
+                )
+            else:  # crypto
+                embed.add_field(
+                    name=f"Crypto: {item['ticker']}",
+                    value=f"{item['amount']} tokens @ {format_crypto_price(item['price_info']['price'])} each\n"
+                    f"Value: ${value:,.2f}",
+                    inline=False,
+                )
+
+        total_assets = portfolio_value + crypto_value
+        embed.add_field(
+            name="Portfolio Summary",
+            value=f"Page Total: ${page_total:,.2f}\n"
+            f"Stocks Value: ${portfolio_value:,.2f}\n"
+            f"Crypto Value: ${crypto_value:,.2f}\n"
+            f"Total Assets: ${total_assets:,.2f}\n"
+            f"Cash Balance: ${user_data['balance']:,.2f}\n"
+            f"Net Worth: ${(total_assets + user_data['balance']):,.2f}",
+            inline=False,
+        )
+
+        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}")
+        return embed
+
+    view = PaginatorView(portfolio_items, 5, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction)
+
+
+@bot.tree.command(name="sell_all", description="Sell all stocks and cryptocurrencies")
+async def sell_all_command(interaction: discord.Interaction):
+    """Sell entire portfolio with confirmation"""
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+
+    if not user_data["portfolio"] and not user_data.get("crypto", {}):
+        await interaction.response.send_message(
+            "You have no assets to sell.", ephemeral=True
+        )
+        return
+
+    # Calculate current values and prepare portfolio details
+    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
+        user_data["portfolio"], user_data.get("crypto", {})
+    )
+
+    total_value = portfolio_value + crypto_value
+    details = []
+
+    # Add stock details
+    for ticker, shares in user_data["portfolio"].items():
+        if ticker in price_info:
+            details.append(
+                f"Stock: {ticker}\n"
+                f"Quantity: {shares} shares\n"
+                f"Current Price: ${price_info[ticker]['price']:,.2f}\n"
+                f"Total Value: ${price_info[ticker]['total_value']:,.2f}\n"
+            )
+
+    # Add crypto details
+    for ticker, amount in user_data.get("crypto", {}).items():
+        key = f"{ticker}-USD"
+        if key in price_info:
+            details.append(
+                f"Crypto: {ticker}\n"
+                f"Amount: {amount}\n"
+                f"Current Price: {format_crypto_price(price_info[key]['price'])}\n"
+                f"Total Value: ${price_info[key]['total_value']:,.2f}\n"
+            )
+
+    embed = discord.Embed(
+        title="⚠️ Confirm Sell All Assets",
+        description="You are about to sell all your stocks and cryptocurrencies.",
+        color=discord.Color.yellow(),
+    )
+
+    embed.add_field(
+        name="Portfolio Summary",
+        value=f"Stocks Value: ${portfolio_value:,.2f}\n"
+        f"Crypto Value: ${crypto_value:,.2f}\n"
+        f"Total Sale Value: ${total_value:,.2f}\n"
+        f"Current Balance: ${user_data['balance']:,.2f}\n"
+        f"Balance After Sale: ${(user_data['balance'] + total_value):,.2f}",
+        inline=False,
+    )
+
+    # Add asset details
+    for detail in details:
+        embed.add_field(name="Asset Details", value=detail, inline=True)
+
+    view = SellAllConfirmationView(user_data, total_value, "\n".join(details))
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 def main():
     bot.run(BOT_TOKEN)
 
