@@ -48,11 +48,19 @@ class PaginatorView(discord.ui.View):
         self.total_pages = (
             min(total_full_pages, max_pages) if max_pages else total_full_pages
         )
+        self.update_button_states()
+
+    def update_button_states(self):
+        # Disable Prev button on first page
+        self.previous_button.disabled = self.current_page == 0
+        # Disable Next button on last page
+        self.next_button.disabled = self.current_page >= self.total_pages - 1
 
     async def send_first_page(
         self, interaction: discord.Interaction, is_followup: bool = False
     ):
         embed = self.build_embed()
+        self.update_button_states()
         if is_followup:
             await interaction.send(embed=embed, view=self)
         else:
@@ -66,6 +74,7 @@ class PaginatorView(discord.ui.View):
 
     async def update_message(self, interaction: discord.Interaction):
         embed = self.build_embed()
+        self.update_button_states()
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
