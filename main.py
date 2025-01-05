@@ -1886,8 +1886,13 @@ async def leaderboard_command(interaction: discord.Interaction):
             member = await interaction.guild.fetch_member(user["_id"])
             if member:
                 # Get detailed portfolio value with real-time prices
-                portfolio_value, _ = await calculate_portfolio_value(user["portfolio"])
-                total_value = user["balance"] + portfolio_value
+                portfolio_value, _, crypto_value = await calculate_portfolio_value(
+                    user["portfolio"],
+                    user.get("crypto", {}),  # Add crypto portfolio
+                )
+                total_value = (
+                    user["balance"] + portfolio_value + crypto_value
+                )  # Include crypto value
                 leaderboard.append((member, total_value))
         except discord.NotFound:
             continue
