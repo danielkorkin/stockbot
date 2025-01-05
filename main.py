@@ -766,6 +766,70 @@ async def chart_command(interaction: discord.Interaction, ticker: str, period: s
     await interaction.followup.send(file=file, embed=embed)
 
 
+async def get_stock_news(ticker: str) -> List[Dict]:
+    try:
+        stock = yf.Ticker(ticker)
+        news = stock.news
+        if not news:
+            return []
+
+        # Format the news items
+        formatted_news = []
+        for item in news[:5]:  # Get latest 5 news items
+            formatted_news.append(
+                {
+                    "title": item.get("title", "No title"),
+                    "publisher": item.get("publisher", "Unknown"),
+                    "link": item.get("link", "#"),
+                    "published": datetime.datetime.fromtimestamp(
+                        item.get("providerPublishTime", 0)
+                    ),
+                    "summary": item.get("summary", "No summary available"),
+                }
+            )
+        return formatted_news
+    except Exception as e:
+        print(f"Error getting news for {ticker}: {e}")
+        return []
+
+
+@bot.tree.command(name="news", description="Show latest news for a stock")
+@app_commands.describe(ticker="Ticker symbol")
+async def news_command(interaction: discord.Interaction, ticker: str):
+    await interaction.response.defer()
+
+    news_items = await get_stock_news(ticker.upper())
+    if not news_items:
+        await interaction.followup.send("No news found for this stock.", ephemeral=True)
+        return
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        news_item = subset[0]  # Since we're showing 1 item per page
+        embed = discord.Embed(
+            title=f"{ticker.upper()} News ({page_idx + 1}/{total_pages})",
+            description=news_item["title"],
+            color=discord.Color.blue(),
+            url=news_item["link"],
+        )
+
+        embed.add_field(
+            name="Summary",
+            value=f"{news_item['summary'][:1000]}...",  # Truncate long summaries
+            inline=False,
+        )
+        embed.add_field(name="Publisher", value=news_item["publisher"], inline=True)
+        embed.add_field(
+            name="Published",
+            value=news_item["published"].strftime("%Y-%m-%d %H:%M UTC"),
+            inline=True,
+        )
+
+        return embed
+
+    view = PaginatorView(news_items, 1, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction.followup, is_followup=True)
+
+
 def main():
     bot.run(BOT_TOKEN)
 
