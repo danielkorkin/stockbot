@@ -738,6 +738,7 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
 @app_commands.describe(
     ticker="Ticker symbol",
     period="Time period (1min,5min,1h,12h,1d,5d,1mo,1y,ytd,5y,max)",
+    chart_type="Chart visualization type",
 )
 @app_commands.choices(
     period=[
@@ -755,9 +756,27 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
             "5y",
             "max",
         ]
-    ]
+    ],
+    chart_type=[
+        app_commands.Choice(name=t, value=t)
+        for t in [
+            "line",
+            "step",
+            "mountain",
+            "baseline",
+            "candle",
+            "bar",
+            "hlc",
+            "wave",
+            "scatter",
+            "histogram",
+            "range",
+        ]
+    ],
 )
-async def chart_command(interaction: discord.Interaction, ticker: str, period: str):
+async def chart_command(
+    interaction: discord.Interaction, ticker: str, period: str, chart_type: str = "line"
+):
     await interaction.response.defer()
 
     history = await get_stock_history(ticker.upper(), period)
@@ -768,22 +787,108 @@ async def chart_command(interaction: discord.Interaction, ticker: str, period: s
     # Create the chart
     plt.figure(figsize=(10, 6))
 
-    # Plot regular market hours in blue
-    plt.plot(
-        history.index, history["Close"], color="blue", label="Regular Hours", alpha=0.8
-    )
+    # Plot based on chart type
+    if chart_type == "line":
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
 
-    # If we have pre/post market data, it will be included in the same line
-    # but we can highlight the current price point
-    current_price = history["Close"].iloc[-1]
-    plt.scatter(history.index[-1], current_price, color="green", s=100, zorder=5)
+    elif chart_type == "step":
+        plt.step(history.index, history["Close"], color="blue", alpha=0.8)
 
-    plt.title(f"{ticker.upper()} Price Chart ({period})")
+    elif chart_type == "mountain":
+        plt.fill_between(history.index, history["Close"], alpha=0.3, color="blue")
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
+
+    elif chart_type == "baseline":
+        baseline = history["Close"].mean()
+        plt.fill_between(
+            history.index,
+            history["Close"],
+            baseline,
+            where=(history["Close"] >= baseline),
+            color="green",
+            alpha=0.3,
+        )
+        plt.fill_between(
+            history.index,
+            history["Close"],
+            baseline,
+            where=(history["Close"] < baseline),
+            color="red",
+            alpha=0.3,
+        )
+        plt.axhline(y=baseline, color="gray", linestyle="--")
+
+    elif chart_type == "candle":
+        import matplotlib.dates as mdates
+        from mplfinance.original_flavor import candlestick_ohlc
+
+        # Convert date to numerical format for candlestick
+        history["Date"] = mdates.date2num(history.index.to_pydatetime())
+        ohlc = history[["Date", "Open", "High", "Low", "Close"]].values
+        candlestick_ohlc(plt.gca(), ohlc, width=0.6, colorup="green", colordown="red")
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+
+    elif chart_type == "bar":
+        # Plot OHLC bars
+        plt.vlines(history.index, history["Low"], history["High"], color="black")
+        plt.hlines(
+            history["Open"],
+            history.index,
+            [i - 0.2 for i in range(len(history.index))],
+            color="black",
+        )
+        plt.hlines(
+            history["Close"],
+            history.index,
+            [i + 0.2 for i in range(len(history.index))],
+            color="black",
+        )
+
+    elif chart_type == "hlc":
+        plt.vlines(history.index, history["Low"], history["High"], color="black")
+        plt.hlines(
+            history["Close"],
+            history.index,
+            [i + 0.2 for i in range(len(history.index))],
+            color="blue",
+        )
+
+    elif chart_type == "wave":
+        plt.fill_between(
+            history.index, history["High"], history["Low"], alpha=0.3, color="blue"
+        )
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
+
+    elif chart_type == "scatter":
+        plt.scatter(
+            history.index,
+            history["Close"],
+            c=history["Close"],
+            cmap="viridis",
+            alpha=0.6,
+        )
+
+    elif chart_type == "histogram":
+        plt.hist(history["Close"], bins=50, alpha=0.6, color="blue")
+        plt.gca().set_ylabel("Frequency")
+
+    elif chart_type == "range":
+        # Plot price range channel
+        upper = history["High"].rolling(window=20).max()
+        lower = history["Low"].rolling(window=20).min()
+        plt.fill_between(history.index, upper, lower, alpha=0.3, color="gray")
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
+
+    plt.title(f"{ticker.upper()} {chart_type.title()} Chart ({period})")
     plt.xlabel("Date/Time")
     plt.ylabel("Price (USD)")
     plt.grid(True, alpha=0.3)
     plt.xticks(rotation=45)
-    plt.legend()
+
+    if chart_type != "histogram":
+        current_price = history["Close"].iloc[-1]
+        plt.scatter(history.index[-1], current_price, color="green", s=100, zorder=5)
+
     plt.tight_layout()
 
     # Save to buffer
@@ -792,22 +897,20 @@ async def chart_command(interaction: discord.Interaction, ticker: str, period: s
     buf.seek(0)
     plt.close()
 
-    # Get current stock info for pre/post market data
+    # Get current stock info and create embed
     stock_info = await get_stock_info(ticker.upper())
-
-    # Create embed with stock info
     price_change = history["Close"].iloc[-1] - history["Close"].iloc[0]
     price_change_pct = (price_change / history["Close"].iloc[0]) * 100
 
     embed = discord.Embed(
-        title=f"{ticker.upper()} Price Chart", color=discord.Color.blue()
+        title=f"{ticker.upper()} {chart_type.title()} Chart", color=discord.Color.blue()
     )
 
-    # Show current price with market status
+    # Add fields to embed
+    current_price = history["Close"].iloc[-1]
     price_text = f"${current_price:,.2f} ({stock_info['market_status']})"
     embed.add_field(name="Current Price", value=price_text, inline=True)
 
-    # Add pre/post market prices if available
     if stock_info["pre_market"]:
         embed.add_field(
             name="Pre-Market", value=f"${stock_info['pre_market']:,.2f}", inline=True
@@ -823,6 +926,7 @@ async def chart_command(interaction: discord.Interaction, ticker: str, period: s
         inline=True,
     )
     embed.add_field(name="Period", value=period, inline=True)
+    embed.add_field(name="Chart Type", value=chart_type.title(), inline=True)
 
     # Send the chart
     file = discord.File(buf, filename=f"{ticker}_chart.png")
