@@ -73,6 +73,9 @@ MAJOR_CRYPTO_SYMBOLS = {
     "BCH": "bitcoin-cash",
 }
 
+# Add after existing constants
+PENDING_ORDERS_COLLECTION = "pending_orders"
+
 
 # Add new helper functions before the PaginatorView class
 # Replace get_coin_id function
@@ -80,7 +83,7 @@ MAJOR_CRYPTO_SYMBOLS = {
 def get_coin_id(symbol: str) -> Optional[str]:
     """Get CoinGecko coin ID from symbol (only for major cryptocurrencies)"""
     upper_symbol = symbol.upper()
-    if upper_symbol in MAJOR_CRYPTO_SYMBOLS:
+    if (upper_symbol := symbol.upper()) in MAJOR_CRYPTO_SYMBOLS:
         return MAJOR_CRYPTO_SYMBOLS[upper_symbol]
     return None
 
@@ -247,6 +250,61 @@ async def get_stock_news(ticker: str) -> List[Dict]:
         return []
 
 
+async def add_pending_order(
+    bot, user_id: int, order_type: str, ticker: str, quantity: float, price: float
+) -> bool:
+    """Add a pending buy/sell order"""
+    try:
+        # Verify user has sufficient funds/stocks before adding order
+        user_data = await get_user_data(bot.user_collection, user_id)
+
+        if order_type == "buy":
+            total_cost = price * quantity
+            if user_data["balance"] < total_cost:
+                return False
+        elif order_type == "sell":
+            if (
+                ticker.upper() not in user_data["portfolio"]
+                or user_data["portfolio"][ticker.upper()] < quantity
+            ):
+                return False
+
+        order = {
+            "user_id": user_id,
+            "type": order_type,
+            "ticker": ticker.upper(),
+            "quantity": quantity,
+            "price": price,
+            "created_at": datetime.datetime.utcnow(),
+        }
+
+        await bot.db[PENDING_ORDERS_COLLECTION].insert_one(order)
+        return True
+    except Exception as e:
+        print(f"Error adding pending order: {e}")
+        return False
+
+
+async def remove_pending_order(bot, order_id: str) -> bool:
+    """Remove a pending order by its ID"""
+    try:
+        result = await bot.db[PENDING_ORDERS_COLLECTION].delete_one({"_id": order_id})
+        return result.deleted_count > 0
+    except Exception as e:
+        print(f"Error removing pending order: {e}")
+        return False
+
+
+async def get_user_pending_orders(bot, user_id: int) -> List[Dict]:
+    """Get all pending orders for a user"""
+    try:
+        cursor = bot.db[PENDING_ORDERS_COLLECTION].find({"user_id": user_id})
+        return await cursor.to_list(length=None)
+    except Exception as e:
+        print(f"Error getting pending orders: {e}")
+        return []
+
+
 class PaginatorView(discord.ui.View):
     def __init__(
         self,
@@ -393,6 +451,14 @@ class AlertManager:
     def __init__(self):
         self.alerts: Dict[str, Set[Tuple[int, discord.TextChannel, float]]] = {}
         self.is_running = False
+        self.bot = None  # Add this line to store bot reference
+
+    def start_monitoring(self, bot):
+        """Initialize monitoring with bot reference"""
+        if not self.is_running:
+            self.is_running = True
+            self.bot = bot  # Store bot reference
+            self.bot.loop.create_task(self.check_alerts())
 
     def add_alert(
         self,
@@ -427,17 +493,21 @@ class AlertManager:
     async def check_alerts(self):
         while True:
             try:
-                for ticker in list(
-                    self.alerts.keys()
-                ):  # Create a copy of keys to avoid runtime modification issues
-                    if not self.alerts.get(ticker):  # Skip if ticker was removed
+                if (
+                    self.bot is None
+                ):  # Change from 'if not self.bot' to explicit None check
+                    print("Bot reference not set in AlertManager")
+                    return
+
+                # Check alerts
+                for ticker in list(self.alerts.keys()):
+                    if not self.alerts.get(ticker):
                         continue
 
                     price = await get_stock_price(ticker)
                     if price is None:
                         continue
 
-                    # Check each alert for this ticker
                     triggered = set()
                     for user_id, channel, target_price in self.alerts[ticker]:
                         if (target_price >= 0 and price >= target_price) or (
@@ -450,21 +520,141 @@ class AlertManager:
                                 f"Current price: ${price:,.2f}"
                             )
 
-                    # Remove triggered alerts
                     if triggered:
                         self.alerts[ticker] -= triggered
                         if not self.alerts[ticker]:
                             del self.alerts[ticker]
 
+                # Check pending orders - Fix database object comparison
+                if (
+                    self.bot.db is not None
+                ):  # Change from 'if self.bot.db' to explicit None check
+                    async for order in self.bot.db[PENDING_ORDERS_COLLECTION].find():
+                        price = await get_stock_price(order["ticker"])
+                        if price is None:
+                            continue
+
+                        if order["type"] == "buy" and price <= order["price"]:
+                            await self.execute_buy_order(order, price)
+                        elif order["type"] == "sell" and price >= order["price"]:
+                            await self.execute_sell_order(order, price)
+
             except Exception as e:
-                print(f"Error checking alerts: {e}")
+                print(f"Error checking alerts/orders: {e}")
 
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(60)
 
-    def start_monitoring(self, bot):
-        if not self.is_running:
-            self.is_running = True
-            bot.loop.create_task(self.check_alerts())
+    async def execute_buy_order(self, order: Dict, current_price: float):
+        """Execute a pending buy order"""
+        if not self.bot:  # Add safety check
+            return
+
+        try:
+            user_data = await get_user_data(self.bot.user_collection, order["user_id"])
+            total_cost = current_price * order["quantity"]
+
+            if user_data["balance"] >= total_cost:
+                # Execute the buy
+                new_balance = user_data["balance"] - total_cost
+                portfolio = user_data["portfolio"]
+                portfolio[order["ticker"]] = (
+                    portfolio.get(order["ticker"], 0) + order["quantity"]
+                )
+
+                transaction = {
+                    "type": "buy",
+                    "ticker": order["ticker"],
+                    "shares": order["quantity"],
+                    "price": current_price,
+                    "total": total_cost,
+                    "timestamp": datetime.datetime.utcnow(),
+                }
+
+                await self.bot.user_collection.update_one(
+                    {"_id": order["user_id"]},
+                    {
+                        "$set": {"balance": new_balance, "portfolio": portfolio},
+                        "$push": {"transactions": transaction},
+                    },
+                )
+
+                # Remove the pending order
+                await self.bot.db[PENDING_ORDERS_COLLECTION].delete_one(
+                    {"_id": order["_id"]}
+                )
+
+                # Notify the user
+                user = await self.bot.fetch_user(order["user_id"])
+                if user:
+                    embed = discord.Embed(
+                        title="Buy Order Executed",
+                        description=f"Bought {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
+                        color=discord.Color.green(),
+                    )
+                    embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}")
+                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                    await user.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error executing buy order: {e}")
+
+    async def execute_sell_order(self, order: Dict, current_price: float):
+        """Execute a pending sell order"""
+        if not self.bot:  # Add safety check
+            return
+
+        try:
+            user_data = await get_user_data(self.bot.user_collection, order["user_id"])
+            portfolio = user_data["portfolio"]
+
+            if (
+                order["ticker"] in portfolio
+                and portfolio[order["ticker"]] >= order["quantity"]
+            ):
+                # Execute the sell
+                total_value = current_price * order["quantity"]
+                new_balance = user_data["balance"] + total_value
+
+                portfolio[order["ticker"]] -= order["quantity"]
+                if portfolio[order["ticker"]] == 0:
+                    del portfolio[order["ticker"]]
+
+                transaction = {
+                    "type": "sell",
+                    "ticker": order["ticker"],
+                    "shares": order["quantity"],
+                    "price": current_price,
+                    "total": total_value,
+                    "timestamp": datetime.datetime.utcnow(),
+                }
+
+                await self.bot.user_collection.update_one(
+                    {"_id": order["user_id"]},
+                    {
+                        "$set": {"balance": new_balance, "portfolio": portfolio},
+                        "$push": {"transactions": transaction},
+                    },
+                )
+
+                # Remove the pending order
+                await self.bot.db[PENDING_ORDERS_COLLECTION].delete_one(
+                    {"_id": order["_id"]}
+                )
+
+                # Notify the user
+                user = await self.bot.fetch_user(order["user_id"])
+                if user:
+                    embed = discord.Embed(
+                        title="Sell Order Executed",
+                        description=f"Sold {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
+                        color=discord.Color.green(),
+                    )
+                    embed.add_field(name="Total Value", value=f"${total_value:,.2f}")
+                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                    await user.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error executing sell order: {e}")
 
 
 async def get_stock_price(ticker: str) -> Optional[float]:
@@ -1299,46 +1489,6 @@ async def stock_lookup_command(interaction: discord.Interaction, ticker: str):
     await interaction.response.send_message(embed=embed)
 
 
-@stock_group.command(name="history", description="Show trading history")
-@app_commands.describe(user="Optional: View another user's history")
-async def stock_history_command(
-    interaction: discord.Interaction, user: discord.Member = None
-):
-    """View trading history with pagination (5 trades per page)"""
-    target_user = user or interaction.user
-    user_data = await get_user_data(bot.user_collection, target_user.id)
-    transactions = user_data["transactions"]
-
-    if not transactions:
-        await interaction.response.send_message(
-            f"{'You have' if user is None else f'{target_user.display_name} has'} no transaction history.",
-            ephemeral=True,
-        )
-        return
-
-    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
-
-    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
-        embed = discord.Embed(
-            title=f"Transaction History - {target_user.display_name}",
-            color=discord.Color.purple(),
-        )
-
-        for tx in subset:
-            timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
-            embed.add_field(
-                name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
-                value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
-                inline=False,
-            )
-
-        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}")
-        return embed
-
-    view = PaginatorView(transactions, 5, embed_factory, interaction.user.id)
-    await view.send_first_page(interaction)
-
-
 @stock_group.command(name="portfolio", description="Show portfolio holdings")
 @app_commands.describe(user="Optional: View another user's portfolio")
 async def stock_portfolio_command(
@@ -1392,6 +1542,181 @@ async def stock_portfolio_command(
 
     view = PaginatorView(portfolio_items, 5, embed_factory, interaction.user.id)
     await view.send_first_page(interaction)
+
+
+@stock_group.command(
+    name="buyat", description="Set up an automatic buy order at a specific price"
+)
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    quantity="Number of shares to buy",
+    price="Target price to buy at",
+)
+async def buyat_command(
+    interaction: discord.Interaction, ticker: str, quantity: int, price: float
+):
+    """Create a pending buy order"""
+    if quantity <= 0 or price <= 0:
+        await interaction.response.send_message(
+            "Please enter positive values.", ephemeral=True
+        )
+        return
+
+    # Verify the ticker exists
+    current_price = await get_stock_price(ticker.upper())
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Add the pending order
+    success = await add_pending_order(
+        bot, interaction.user.id, "buy", ticker, quantity, price
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            "Insufficient funds for this order. Make sure you have enough balance.",
+            ephemeral=True,
+        )
+        return
+
+    total_cost = price * quantity
+    embed = discord.Embed(
+        title="Buy Order Created",
+        description=f"Will buy {ticker.upper()} when price reaches ${price:,.2f}",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Quantity", value=str(quantity), inline=True)
+    embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}", inline=True)
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(
+    name="sellat", description="Set up an automatic sell order at a specific price"
+)
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    quantity="Number of shares to sell",
+    price="Target price to sell at",
+)
+async def sellat_command(
+    interaction: discord.Interaction, ticker: str, quantity: int, price: float
+):
+    """Create a pending sell order"""
+    if quantity <= 0 or price <= 0:
+        await interaction.response.send_message(
+            "Please enter positive values.", ephemeral=True
+        )
+        return
+
+    # Verify the ticker exists and user has sufficient shares
+    current_price = await get_stock_price(ticker.upper())
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Add the pending order
+    success = await add_pending_order(
+        bot, interaction.user.id, "sell", ticker, quantity, price
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            "Insufficient shares for this order. Make sure you own enough shares.",
+            ephemeral=True,
+        )
+        return
+
+    total_value = price * quantity
+    embed = discord.Embed(
+        title="Sell Order Created",
+        description=f"Will sell {ticker.upper()} when price reaches ${price:,.2f}",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Quantity", value=str(quantity), inline=True)
+    embed.add_field(name="Total Value", value=f"${total_value:,.2f}", inline=True)
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(name="pending", description="View your pending buy/sell orders")
+async def pending_orders_command(interaction: discord.Interaction):
+    """View pending orders with pagination"""
+    await interaction.response.defer()
+
+    orders = await get_user_pending_orders(bot, interaction.user.id)
+    if not orders:
+        await interaction.followup.send("You have no pending orders.", ephemeral=True)
+        return
+
+    class OrderPaginatorView(PaginatorView):
+        async def cancel_order(
+            self, button: discord.ui.Button, interaction: discord.Interaction
+        ):
+            order = self.items[self.current_page]
+            success = await remove_pending_order(bot, order["_id"])
+            if success:
+                self.items.pop(self.current_page)
+                if not self.items:
+                    await interaction.response.edit_message(
+                        content="No more pending orders.", embed=None, view=None
+                    )
+                    return
+                self.total_pages = max(
+                    1, math.ceil(len(self.items) / self.items_per_page)
+                )
+                await self.update_message(interaction)
+            else:
+                await interaction.response.send_message(
+                    "Failed to cancel order.", ephemeral=True
+                )
+
+        @discord.ui.button(label="Cancel Order", style=discord.ButtonStyle.red)
+        async def cancel_button(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await self.cancel_order(button, interaction)
+
+    def create_order_embed(
+        page_idx: int, total_pages: int, subset: list
+    ) -> discord.Embed:
+        order = subset[0]  # Show one order per page
+        order_type = order["type"].capitalize()
+        ticker = order["ticker"]
+        embed = discord.Embed(
+            title=f"Pending Orders ({page_idx + 1}/{total_pages})",
+            color=discord.Color.blue(),
+        )
+
+        total = order["price"] * order["quantity"]
+        embed.add_field(name="Type", value=order_type, inline=True)
+        embed.add_field(name="Stock", value=ticker, inline=True)
+        embed.add_field(name="Quantity", value=str(order["quantity"]), inline=True)
+        embed.add_field(
+            name="Target Price", value=f"${order['price']:,.2f}", inline=True
+        )
+        embed.add_field(
+            name=f"Total {'Cost' if order_type == 'Buy' else 'Value'}",
+            value=f"${total:,.2f}",
+            inline=True,
+        )
+        embed.add_field(
+            name="Created",
+            value=order["created_at"].strftime("%Y-%m-%d %H:%M UTC"),
+            inline=True,
+        )
+
+        return embed
+
+    view = OrderPaginatorView(orders, 1, create_order_embed, interaction.user.id)
+    await view.send_first_page(interaction.followup, is_followup=True)
 
 
 async def get_market_hours() -> Dict:
@@ -2262,6 +2587,90 @@ async def crypto_lookup_command(interaction: discord.Interaction, ticker: str):
         )
 
     await interaction.followup.send(embed=embed)  # Change to followup
+
+
+@bot.tree.command(name="history", description="Show your trading history")
+@app_commands.describe(user="Optional: View another user's history")
+async def history_command(
+    interaction: discord.Interaction, user: discord.Member = None
+):
+    """View trading history with pagination (5 trades per page)"""
+    target_user = user or interaction.user
+    user_data = await get_user_data(bot.user_collection, target_user.id)
+    transactions = user_data["transactions"]
+
+    if not transactions:
+        await interaction.response.send_message(
+            f"{'You have' if user is None else f'{target_user.display_name} has'} no transaction history.",
+            ephemeral=True,
+        )
+        return
+
+    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Transaction History - {target_user.display_name}",
+            color=discord.Color.purple(),
+        )
+
+        for tx in subset:
+            timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            if tx["type"] in ["crypto_buy", "crypto_sell"]:
+                action = "Buy" if tx["type"] == "crypto_buy" else "Sell"
+                embed.add_field(
+                    name=f"Crypto {action} {tx['amount']} {tx['ticker']}",
+                    value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                    inline=False,
+                )
+            else:  # Stock transactions
+                embed.add_field(
+                    name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
+                    value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                    inline=False,
+                )
+
+        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}")
+        return embed
+
+    view = PaginatorView(transactions, 5, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction)
+
+
+@bot.tree.command(name="balance", description="Show your cash balance and net worth")
+@app_commands.describe(user="Optional: View another user's balance")
+async def balance_command(
+    interaction: discord.Interaction, user: discord.Member = None
+):
+    """Show user's balance including crypto holdings"""
+    target_user = user or interaction.user
+    user_data = await get_user_data(bot.user_collection, target_user.id)
+    balance = round(user_data["balance"], 2)
+
+    # Get detailed portfolio values
+    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
+        user_data["portfolio"], user_data.get("crypto", {})
+    )
+    total_value = round(balance + portfolio_value + crypto_value, 2)
+
+    embed = discord.Embed(
+        title=f"Balance Sheet - {target_user.display_name}", color=discord.Color.green()
+    )
+    embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
+    embed.add_field(
+        name="Stock Portfolio", value=f"${portfolio_value:,.2f}", inline=True
+    )
+    embed.add_field(name="Crypto Portfolio", value=f"${crypto_value:,.2f}", inline=True)
+    embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
+
+    # Add timestamp to show when values were last updated
+    embed.set_footer(
+        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    await interaction.response.send_message(embed=embed)
+
 
 def main():
     bot.run(BOT_TOKEN)
