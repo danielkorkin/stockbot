@@ -7,7 +7,7 @@ import os
 
 # Replace pynescript import with re
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp  # Add this to the imports at the top
 import discord
@@ -130,6 +130,7 @@ class StockBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.db = None
         self.user_collection = None
+        self.alert_manager = AlertManager()
 
     async def setup_hook(self):
         try:
@@ -151,6 +152,8 @@ class StockBot(commands.Bot):
         self.db = client[MONGO_DB_NAME]
         self.user_collection = self.db["users"]
 
+        self.alert_manager.start_monitoring(self)
+
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         await self.change_presence(
@@ -158,6 +161,84 @@ class StockBot(commands.Bot):
                 type=discord.ActivityType.watching, name="the Stock Market"
             )
         )
+
+
+class AlertManager:
+    def __init__(self):
+        self.alerts: Dict[str, Set[Tuple[int, discord.TextChannel, float]]] = {}
+        self.is_running = False
+
+    def add_alert(
+        self,
+        ticker: str,
+        user_id: int,
+        channel: discord.TextChannel,
+        target_price: float,
+    ):
+        if ticker not in self.alerts:
+            self.alerts[ticker] = set()
+        self.alerts[ticker].add((user_id, channel, target_price))
+
+    def remove_alerts(
+        self, ticker: str, user_id: int
+    ) -> List[Tuple[discord.TextChannel, float]]:
+        if ticker not in self.alerts:
+            return []
+
+        # Find all alerts for this user/ticker combination
+        user_alerts = [
+            (ch, price) for (uid, ch, price) in self.alerts[ticker] if uid == user_id
+        ]
+        # Remove them from the set
+        self.alerts[ticker] = {
+            alert for alert in self.alerts[ticker] if alert[0] != user_id
+        }
+        # Clean up empty tickers
+        if not self.alerts[ticker]:
+            del self.alerts[ticker]
+        return user_alerts
+
+    async def check_alerts(self):
+        while True:
+            try:
+                for ticker in list(
+                    self.alerts.keys()
+                ):  # Create a copy of keys to avoid runtime modification issues
+                    if not self.alerts.get(ticker):  # Skip if ticker was removed
+                        continue
+
+                    price = await get_stock_price(ticker)
+                    if price is None:
+                        continue
+
+                    # Check each alert for this ticker
+                    triggered = set()
+                    for user_id, channel, target_price in self.alerts[ticker]:
+                        if (target_price >= 0 and price >= target_price) or (
+                            target_price < 0 and price <= abs(target_price)
+                        ):
+                            triggered.add((user_id, channel, target_price))
+                            await channel.send(
+                                f"<@{user_id}> Alert triggered for {ticker}!\n"
+                                f"Target price: ${abs(target_price):,.2f} {'(above)' if target_price >= 0 else '(below)'}\n"
+                                f"Current price: ${price:,.2f}"
+                            )
+
+                    # Remove triggered alerts
+                    if triggered:
+                        self.alerts[ticker] -= triggered
+                        if not self.alerts[ticker]:
+                            del self.alerts[ticker]
+
+            except Exception as e:
+                print(f"Error checking alerts: {e}")
+
+            await asyncio.sleep(60)  # Check every minute
+
+    def start_monitoring(self, bot):
+        if not self.is_running:
+            self.is_running = True
+            bot.loop.create_task(self.check_alerts())
 
 
 async def get_stock_price(ticker: str) -> Optional[float]:
@@ -1411,6 +1492,82 @@ async def strategy_command(
         modal = PineStrategyModal()
         modal.view = view
         await interaction.response.send_modal(modal)
+
+
+@bot.tree.command(name="alert", description="Set a price alert for a stock")
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    price="Target price (positive for above, negative for below)",
+)
+async def alert_command(interaction: discord.Interaction, ticker: str, price: float):
+    """Set a price alert. Use positive price for above alerts, negative for below alerts."""
+    ticker = ticker.upper()
+
+    # Verify the ticker exists
+    current_price = await get_stock_price(ticker)
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Add the alert
+    bot.alert_manager.add_alert(ticker, interaction.user.id, interaction.channel, price)
+
+    alert_type = "above" if price >= 0 else "below"
+    embed = discord.Embed(
+        title="Price Alert Set",
+        description=f"You will be notified when {ticker} goes {alert_type} ${abs(price):,.2f}",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+    embed.add_field(
+        name="Target Price", value=f"${abs(price):,.2f} ({alert_type})", inline=True
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="alerts", description="View or clear your price alerts")
+@app_commands.describe(
+    ticker="Stock ticker to clear alerts for (optional)",
+    clear="Whether to clear the alerts for the specified ticker",
+)
+async def alerts_command(
+    interaction: discord.Interaction, ticker: Optional[str] = None, clear: bool = False
+):
+    """View or clear your price alerts."""
+    if ticker and clear:
+        ticker = ticker.upper()
+        removed = bot.alert_manager.remove_alerts(ticker, interaction.user.id)
+        if removed:
+            await interaction.response.send_message(
+                f"Cleared {len(removed)} alert(s) for {ticker}."
+            )
+        else:
+            await interaction.response.send_message(
+                f"No alerts found for {ticker}.", ephemeral=True
+            )
+        return
+
+    # Show all alerts
+    embed = discord.Embed(title="Your Price Alerts", color=discord.Color.blue())
+    alerts_found = False
+
+    for t, alerts in bot.alert_manager.alerts.items():
+        user_alerts = [a for a in alerts if a[0] == interaction.user.id]
+        if user_alerts:
+            alerts_found = True
+            alert_texts = []
+            for _, _, price in user_alerts:
+                alert_type = "above" if price >= 0 else "below"
+                alert_texts.append(f"${abs(price):,.2f} ({alert_type})")
+            embed.add_field(name=t, value="\n".join(alert_texts), inline=False)
+
+    if not alerts_found:
+        embed.description = "You have no active price alerts."
+
+    await interaction.response.send_message(embed=embed)
 
 
 def main():
