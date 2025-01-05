@@ -9,6 +9,9 @@ import os
 # Replace pynescript import with re
 import re
 
+# Add to imports section at the top
+from datetime import datetime, timedelta
+
 # Add after existing imports
 from decimal import Decimal
 from functools import lru_cache
@@ -48,6 +51,13 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # Add new constants after existing configuration constants
 CRYPTO_MIN_TRADE = Decimal("0.01")
 COINGECKO = CoinGeckoAPI()
+
+# Add near the constants section
+BANKRUPTCY_COOLDOWN = timedelta(days=7)  # 7 day cooldown
+BANKRUPTCY_COLLECTION = "bankruptcy_records"  # Collection to store bankruptcy dates
+INITIAL_BALANCE = float(
+    os.getenv("INITIAL_BALANCE", 10000.0)
+)  # Already exists, reference it
 
 # Add after configuration constants
 MAJOR_CRYPTO_SYMBOLS = {
@@ -3002,6 +3012,173 @@ async def sell_all_command(interaction: discord.Interaction):
         embed.add_field(name="Asset Details", value=detail, inline=True)
 
     view = SellAllConfirmationView(user_data, total_value, "\n".join(details))
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# Add the following classes after other UI classes
+class BankruptcyConfirmationView(discord.ui.View):
+    def __init__(self, user_data: dict, total_value: float, portfolio_details: str):
+        super().__init__()
+        self.user_data = user_data
+        self.total_value = total_value
+        self.portfolio_details = portfolio_details
+
+    @discord.ui.button(label="Declare Bankruptcy", style=discord.ButtonStyle.danger)
+    async def confirm_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = BankruptcyConfirmModal(self.user_data, self.total_value)
+        await interaction.response.send_modal(modal)
+
+
+class BankruptcyConfirmModal(discord.ui.Modal, title="Confirm Bankruptcy"):
+    confirmation = discord.ui.TextInput(
+        label="Type 'CONFIRM' to declare bankruptcy",
+        placeholder="CONFIRM",
+        required=True,
+    )
+
+    def __init__(self, user_data: dict, total_value: float):
+        super().__init__()
+        self.user_data = user_data
+        self.total_value = total_value
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirmation.value != "CONFIRM":
+            await interaction.response.send_message(
+                "Bankruptcy cancelled - incorrect confirmation.", ephemeral=True
+            )
+            return
+
+        # Record bankruptcy date
+        await bot.db[BANKRUPTCY_COLLECTION].insert_one(
+            {
+                "user_id": interaction.user.id,
+                "timestamp": datetime.utcnow(),
+                "total_value": self.total_value,
+            }
+        )
+
+        # Create bankruptcy transaction record
+        transaction = {
+            "type": "bankruptcy",
+            "value_liquidated": self.total_value,
+            "timestamp": datetime.utcnow(),
+            "new_balance": INITIAL_BALANCE,
+        }
+
+        # Reset user's account
+        await bot.user_collection.update_one(
+            {"_id": interaction.user.id},
+            {
+                "$set": {"balance": INITIAL_BALANCE, "portfolio": {}, "crypto": {}},
+                "$push": {"transactions": transaction},
+            },
+        )
+
+        embed = discord.Embed(
+            title="Bankruptcy Declared",
+            description="Your account has been reset.",
+            color=discord.Color.red(),
+        )
+        embed.add_field(
+            name="Assets Liquidated", value=f"${self.total_value:,.2f}", inline=True
+        )
+        embed.add_field(
+            name="New Balance", value=f"${INITIAL_BALANCE:,.2f}", inline=True
+        )
+        embed.set_footer(
+            text=f"You cannot declare bankruptcy again until {(datetime.utcnow() + BANKRUPTCY_COOLDOWN).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+        await interaction.response.send_message(embed=embed)
+
+
+# Add the bankruptcy command after other commands
+@bot.tree.command(
+    name="bankruptcy",
+    description="Declare bankruptcy to reset your account (7-day cooldown)",
+)
+async def bankruptcy_command(interaction: discord.Interaction):
+    """Declare bankruptcy to reset your account balance to $10,000"""
+    # Check cooldown
+    last_bankruptcy = await bot.db[BANKRUPTCY_COLLECTION].find_one(
+        {"user_id": interaction.user.id}, sort=[("timestamp", -1)]
+    )
+
+    if last_bankruptcy:
+        time_since = datetime.utcnow() - last_bankruptcy["timestamp"]
+        if time_since < BANKRUPTCY_COOLDOWN:
+            time_left = BANKRUPTCY_COOLDOWN - time_since
+            await interaction.response.send_message(
+                f"You must wait {time_left.days} days and {time_left.seconds // 3600} hours before declaring bankruptcy again.",
+                ephemeral=True,
+            )
+            return
+
+    # Get user data and calculate values
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
+        user_data["portfolio"], user_data.get("crypto", {})
+    )
+
+    total_value = user_data["balance"] + portfolio_value + crypto_value
+
+    # Create portfolio details string
+    details = []
+    for ticker, shares in user_data["portfolio"].items():
+        if ticker in price_info:
+            details.append(
+                f"Stock: {ticker}\n"
+                f"Shares: {shares}\n"
+                f"Value: ${price_info[ticker]['total_value']:,.2f}"
+            )
+
+    for ticker, amount in user_data.get("crypto", {}).items():
+        key = f"{ticker}-USD"
+        if key in price_info:
+            details.append(
+                f"Crypto: {ticker}\n"
+                f"Amount: {amount}\n"
+                f"Value: ${price_info[key]['total_value']:,.2f}"
+            )
+
+    # Create confirmation embed
+    embed = discord.Embed(
+        title="⚠️ Declare Bankruptcy",
+        description=(
+            "**Warning:** This will:\n"
+            "- Sell all your assets\n"
+            "- Reset your balance to $10,000\n"
+            "- Put you on a 7-day cooldown\n"
+            "This action cannot be undone!"
+        ),
+        color=discord.Color.red(),
+    )
+
+    embed.add_field(
+        name="Current Assets",
+        value=(
+            f"Cash Balance: ${user_data['balance']:,.2f}\n"
+            f"Stock Value: ${portfolio_value:,.2f}\n"
+            f"Crypto Value: ${crypto_value:,.2f}\n"
+            f"Total Value: ${total_value:,.2f}"
+        ),
+        inline=False,
+    )
+
+    if details:
+        embed.add_field(
+            name="Assets to be Liquidated", value="\n\n".join(details), inline=False
+        )
+
+    embed.add_field(
+        name="Final Balance",
+        value=f"Your balance will be reset to ${INITIAL_BALANCE:,.2f}",
+        inline=False,
+    )
+
+    view = BankruptcyConfirmationView(user_data, total_value, "\n".join(details))
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
