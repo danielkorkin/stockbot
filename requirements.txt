@@ -8,3 +8,5 @@ numpy==1.23.5
 pandas-ta==0.3.14b
 mplfinance==0.12.10b0
 pytz==2024.1
+pycoingecko==3.2.0
+aiohttp==3.11.11

@@ -8,6 +8,10 @@ import os
 
 # Replace pynescript import with re
 import re
+
+# Add after existing imports
+from decimal import Decimal
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp  # Add this to the imports at the top
@@ -24,6 +28,9 @@ from discord import TextStyle, app_commands, ui
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# Add to imports section
+from pycoingecko import CoinGeckoAPI
+
 load_dotenv()
 
 ###########################
@@ -37,6 +44,207 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "StockBotDB")
 INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", 10000.0))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+# Add new constants after existing configuration constants
+CRYPTO_MIN_TRADE = Decimal("0.01")
+COINGECKO = CoinGeckoAPI()
+
+# Add after configuration constants
+MAJOR_CRYPTO_SYMBOLS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "USDT": "tether",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "USDC": "usd-coin",
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "TRX": "tron",
+    "LINK": "chainlink",
+    "MATIC": "matic-network",
+    "TON": "the-open-network",
+    "DAI": "dai",
+    "SHIB": "shiba-inu",
+    "UNI": "uniswap",
+    "LTC": "litecoin",
+    "BCH": "bitcoin-cash",
+}
+
+
+# Add new helper functions before the PaginatorView class
+# Replace get_coin_id function
+@lru_cache(maxsize=100)
+def get_coin_id(symbol: str) -> Optional[str]:
+    """Get CoinGecko coin ID from symbol (only for major cryptocurrencies)"""
+    upper_symbol = symbol.upper()
+    if upper_symbol in MAJOR_CRYPTO_SYMBOLS:
+        return MAJOR_CRYPTO_SYMBOLS[upper_symbol]
+    return None
+
+
+async def get_crypto_price(ticker: str) -> Optional[float]:
+    """Get current price for a cryptocurrency using CoinGecko"""
+    try:
+        coin_id = get_coin_id(ticker)
+        if not coin_id:
+            print(f"Could not find coin ID for {ticker}")
+            return None
+
+        # Add debug logging
+        print(f"Getting price for coin_id: {coin_id}")
+
+        price_data = COINGECKO.get_price(
+            ids=coin_id,
+            vs_currencies="usd",
+            include_market_cap=True,
+            include_24hr_vol=True,
+            include_24hr_change=True,
+        )
+
+        print(f"Raw price data: {price_data}")  # Debug log
+
+        if coin_id in price_data and "usd" in price_data[coin_id]:
+            price = float(price_data[coin_id]["usd"])
+            print(f"Parsed price for {ticker}: ${price}")  # Debug log
+            return price
+
+        print(f"No price data found for {ticker}")  # Debug log
+        return None
+    except Exception as e:
+        print(f"Error getting crypto price for {ticker}: {e}")
+        return None
+
+
+async def get_crypto_info(ticker: str) -> Optional[Dict]:
+    """Get detailed information about a cryptocurrency using CoinGecko"""
+    try:
+        coin_id = get_coin_id(ticker)
+        if not coin_id:
+            print(f"Could not find coin ID for {ticker}")
+            return None
+
+        # Add debug logging
+        print(f"Getting info for coin_id: {coin_id}")
+
+        data = COINGECKO.get_coin_by_id(
+            coin_id,
+            localization=False,
+            tickers=False,
+            market_data=True,
+            community_data=False,
+            developer_data=False,
+            sparkline=False,
+        )
+
+        market_data = data.get("market_data", {})
+        current_price = market_data.get("current_price", {}).get("usd")
+
+        if not current_price:
+            print(f"No price found in market data for {ticker}")
+            return None
+
+        price = float(current_price)
+        if price <= 0:
+            print(f"Invalid price ({price}) for {ticker}")
+            return None
+
+        return {
+            "name": data.get("name", ticker.upper()),
+            "symbol": data.get("symbol", "").upper(),
+            "price": price,
+            "market_cap": float(market_data.get("market_cap", {}).get("usd", 0)),
+            "volume_24h": float(market_data.get("total_volume", {}).get("usd", 0)),
+            "circulating_supply": float(market_data.get("circulating_supply", 0)),
+            "total_supply": float(market_data.get("total_supply", 0) or 0),
+            "price_change_24h": float(
+                market_data.get("price_change_percentage_24h", 0)
+            ),
+            "ath": float(market_data.get("ath", {}).get("usd", 0)),
+            "ath_date": market_data.get("ath_date", {}).get("usd", ""),
+        }
+    except Exception as e:
+        print(f"Error getting crypto info for {ticker}: {e}")
+        return None
+
+
+async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Update period and interval mappings for better short-term data
+        period_map = {
+            "1mo": "1mo",
+            "3mo": "3mo",
+            "6mo": "6mo",
+            "1y": "1y",
+            "2y": "2y",
+            "5y": "5y",
+            "max": "max",
+        }
+
+        interval_map = {
+            "1mo": "1d",  # Daily data for 1 month
+            "3mo": "1d",  # Daily data for 3 months
+            "6mo": "1d",  # Daily data for 6 months
+            "1y": "1d",  # Daily data for 1 year
+            "2y": "1d",  # Daily data for 2 years
+            "5y": "1wk",  # Weekly data for 5 years
+            "max": "1mo",  # Monthly data for max period
+        }
+
+        yf_period = period_map.get(period, "1mo")
+        yf_interval = interval_map.get(period, "1d")
+
+        print(
+            f"Fetching data for {ticker} with period: {yf_period}, interval: {yf_interval}"
+        )
+
+        # Get historical data
+        history = stock.history(period=yf_period, interval=yf_interval, prepost=True)
+
+        if history.empty:
+            print(f"No data returned for {ticker}")
+            return None
+
+        # Print data info for debugging
+        print(f"Fetched {len(history)} data points")
+        print(f"Date range: {history.index[0]} to {history.index[-1]}")
+
+        return history
+
+    except Exception as e:
+        print(f"Error getting history for {ticker}: {e}")
+        return None
+
+
+async def get_stock_news(ticker: str) -> List[Dict]:
+    try:
+        stock = yf.Ticker(ticker)
+        news = stock.news
+        if not news:
+            return []
+
+        # Format the news items
+        formatted_news = []
+        for item in news[:5]:  # Get latest 5 news items
+            formatted_news.append(
+                {
+                    "title": item.get("title", "No title"),
+                    "publisher": item.get("publisher", "Unknown"),
+                    "link": item.get("link", "#"),
+                    "published": datetime.datetime.fromtimestamp(
+                        item.get("providerPublishTime", 0)
+                    ),
+                    "summary": item.get("summary", "No summary available"),
+                }
+            )
+        return formatted_news
+    except Exception as e:
+        print(f"Error getting news for {ticker}: {e}")
+        return []
 
 
 class PaginatorView(discord.ui.View):
@@ -133,22 +341,37 @@ class StockBot(commands.Bot):
         self.db = None
         self.user_collection = None
         self.alert_manager = AlertManager()
-        # Remove the stock_group addition from here
 
     async def setup_hook(self):
         try:
+            # Add commands to the command tree first
+            self.tree.add_command(stock_group)
+            self.tree.add_command(crypto_group)
+
             if ENVIRONMENT.lower() == "development":
+                # Sync to test guild
+                print("Development environment detected, syncing to test guild...")
                 self.tree.copy_global_to(guild=discord.Object(id=TEST_GUILD_ID))
                 await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
-                print("Slash commands synced to test guild.")
-            else:
-                # Clear the commands from test guild first
-                self.tree.clear_commands(guild=discord.Object(id=TEST_GUILD_ID))
-                # Then sync globally
+                # Clear global commands in development
                 await self.tree.sync()
-                print("Slash commands synced globally.")
+                print("Commands synced to test guild and cleared globally")
+            else:
+                # Production: Clear test guild commands and sync globally
+                print("Production environment detected, syncing globally...")
+                await self.tree.sync()
+                # Clear test guild specific commands
+                self.tree.clear_commands(guild=discord.Object(id=TEST_GUILD_ID))
+                await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+                print("Commands synced globally and cleared from test guild")
+
+            print(
+                f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}"
+            )
+
         except Exception as e:
             print(f"Error syncing commands: {e}")
+            raise  # Re-raise the exception for better error tracking
 
         # Setup MongoDB
         client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
@@ -156,7 +379,6 @@ class StockBot(commands.Bot):
         self.user_collection = self.db["users"]
 
         self.alert_manager.start_monitoring(self)
-        self.tree.add_command(stock_group)  # Move it here instead
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -330,6 +552,7 @@ async def get_stock_info(ticker: str) -> Optional[Dict]:
         return None
 
 
+# Modify get_user_data function to include crypto
 async def get_user_data(user_collection, user_id: int):
     user_data = await user_collection.find_one({"_id": user_id})
     if not user_data:
@@ -337,17 +560,26 @@ async def get_user_data(user_collection, user_id: int):
             "_id": user_id,
             "balance": INITIAL_BALANCE,
             "portfolio": {},
+            "crypto": {},  # Add crypto portfolio
             "transactions": [],
         }
         await user_collection.insert_one(user_data)
+    elif "crypto" not in user_data:  # Add crypto field if missing
+        user_data["crypto"] = {}
+        await user_collection.update_one({"_id": user_id}, {"$set": {"crypto": {}}})
     return user_data
 
 
-async def calculate_portfolio_value(portfolio: Dict[str, int]) -> tuple[float, dict]:
-    """Calculate portfolio value using the most recent prices available."""
+# Modify calculate_portfolio_value to include crypto
+async def calculate_portfolio_value(
+    portfolio: Dict[str, int], crypto: Dict[str, float] = None
+) -> tuple[float, dict, float]:
+    """Calculate total portfolio value including stocks and crypto"""
     total = 0.0
     price_info = {}
+    crypto_value = 0.0
 
+    # Calculate stock portfolio value
     for ticker, shares in portfolio.items():
         info = await get_stock_info(ticker)
         if info and info["price"] > 0:
@@ -358,13 +590,21 @@ async def calculate_portfolio_value(portfolio: Dict[str, int]) -> tuple[float, d
                 "market_status": info["market_status"],
                 "total_value": value,
             }
-            print(
-                f"Portfolio value for {ticker}: ${value:,.2f} ({shares} shares @ ${info['price']:,.2f} - {info['market_status']})"
-            )
-        else:
-            print(f"Warning: Could not get valid price for {ticker}")
 
-    return round(total, 2), price_info
+    # Calculate crypto portfolio value
+    if crypto:
+        for ticker, amount in crypto.items():
+            price = await get_crypto_price(ticker)
+            if price:
+                value = price * amount
+                crypto_value += value
+                price_info[f"{ticker}-USD"] = {
+                    "price": price,
+                    "market_status": "24/7",
+                    "total_value": value,
+                }
+
+    return round(total, 2), price_info, round(crypto_value, 2)
 
 
 async def get_top_stocks() -> List[Dict]:  # Change this line
@@ -1300,34 +1540,15 @@ async def stock_today_command(interaction: discord.Interaction):
         losers_text += f"**{stock['ticker']}**: {stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
     embed.add_field(name="Top Losers", value=losers_text or "No data", inline=False)
 
-    await interaction.followup.send(embed=embed)
-
-
-bot = StockBot()
-
-
-@bot.tree.command(name="balance", description="Show your cash balance.")
-async def balance_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    balance = round(user_data["balance"], 2)
-
-    # Get detailed portfolio value
-    portfolio_value, _ = await calculate_portfolio_value(user_data["portfolio"])
-    total_value = round(balance + portfolio_value, 2)
-
-    embed = discord.Embed(title="Balance Sheet", color=discord.Color.green())
-    embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
-    embed.add_field(
-        name="Portfolio Value", value=f"${portfolio_value:,.2f}", inline=True
-    )
-    embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
-
     # Add timestamp to show when values were last updated
     embed.set_footer(
         text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
+
+
+bot = StockBot()
 
 
 @bot.tree.command(name="leaderboard", description="Show the top users by net worth.")
@@ -1732,6 +1953,315 @@ async def fetch_algorithm_code(url: str) -> Optional[str]:
         print(f"Error fetching algorithm code: {e}")
         return None
 
+
+# Add crypto command group
+crypto_group = app_commands.Group(
+    name="crypto", description="Cryptocurrency related commands"
+)
+
+
+@crypto_group.command(name="buy", description="Buy cryptocurrency")
+@app_commands.describe(
+    ticker="Crypto ticker symbol (e.g. BTC, ETH)", amount="Amount to buy (minimum 0.01)"
+)
+async def crypto_buy_command(
+    interaction: discord.Interaction, ticker: str, amount: float
+):
+    if amount < float(CRYPTO_MIN_TRADE):
+        await interaction.response.send_message(
+            f"Minimum trade amount is {CRYPTO_MIN_TRADE} units.", ephemeral=True
+        )
+        return
+
+    price = await get_crypto_price(ticker.upper())
+    if not price:
+        await interaction.response.send_message(
+            "Invalid cryptocurrency symbol.", ephemeral=True
+        )
+        return
+
+    total_cost = price * amount
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+
+    if user_data["balance"] < total_cost:
+        await interaction.response.send_message("Insufficient funds.", ephemeral=True)
+        return
+
+    new_balance = user_data["balance"] - total_cost
+    crypto = user_data.get("crypto", {})
+    crypto[ticker.upper()] = crypto.get(ticker.upper(), 0) + amount
+
+    transaction = {
+        "type": "crypto_buy",
+        "ticker": ticker.upper(),
+        "amount": amount,
+        "price": price,
+        "total": total_cost,
+        "timestamp": datetime.datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "crypto": crypto},
+            "$push": {"transactions": transaction},
+        },
+    )
+
+    embed = discord.Embed(
+        title="Crypto Purchase Successful", color=discord.Color.green()
+    )
+    embed.add_field(name="Cryptocurrency", value=ticker.upper(), inline=True)
+    embed.add_field(name="Amount", value=str(amount), inline=True)
+    embed.add_field(name="Price/Unit", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}", inline=True)
+    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@crypto_group.command(name="sell", description="Sell cryptocurrency")
+@app_commands.describe(
+    ticker="Crypto ticker symbol (e.g. BTC, ETH)",
+    amount="Amount to sell (minimum 0.01)",
+)
+async def crypto_sell_command(
+    interaction: discord.Interaction, ticker: str, amount: float
+):
+    if amount < float(CRYPTO_MIN_TRADE):
+        await interaction.response.send_message(
+            f"Minimum trade amount is {CRYPTO_MIN_TRADE} units.", ephemeral=True
+        )
+        return
+
+    price = await get_crypto_price(ticker.upper())
+    if not price:
+        await interaction.response.send_message(
+            "Invalid cryptocurrency symbol.", ephemeral=True
+        )
+        return
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    crypto = user_data.get("crypto", {})
+
+    if ticker.upper() not in crypto or crypto[ticker.upper()] < amount:
+        await interaction.response.send_message(
+            "Insufficient cryptocurrency balance.", ephemeral=True
+        )
+        return
+
+    total_value = price * amount
+    new_balance = user_data["balance"] + total_value
+
+    crypto[ticker.upper()] -= amount
+    if crypto[ticker.upper()] == 0:
+        del crypto[ticker.upper()]
+
+    transaction = {
+        "type": "crypto_sell",
+        "ticker": ticker.upper(),
+        "amount": amount,
+        "price": price,
+        "total": total_value,
+        "timestamp": datetime.datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "crypto": crypto},
+            "$push": {"transactions": transaction},
+        },
+    )
+
+    embed = discord.Embed(title="Crypto Sale Successful", color=discord.Color.green())
+    embed.add_field(name="Cryptocurrency", value=ticker.upper(), inline=True)
+    embed.add_field(name="Amount", value=str(amount), inline=True)
+    embed.add_field(name="Price/Unit", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Total Value", value=f"${total_value:,.2f}", inline=True)
+    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@crypto_group.command(name="chart", description="Show price chart for a cryptocurrency")
+@app_commands.describe(
+    ticker="Crypto ticker symbol (e.g. BTC, ETH)",
+    period="Time period for chart",
+    chart_type="Chart visualization type",
+)
+@app_commands.choices(
+    period=[
+        app_commands.Choice(name=p, value=p)
+        for p in ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
+    ],
+    chart_type=[
+        app_commands.Choice(name=t, value=t)
+        for t in ["line", "candle", "mountain", "baseline"]
+    ],
+)
+async def crypto_chart_command(
+    interaction: discord.Interaction, ticker: str, period: str, chart_type: str = "line"
+):
+    await interaction.response.defer()
+
+    # Convert crypto ticker to yfinance format
+    yf_ticker = f"{ticker.upper()}-USD"
+
+    # Get historical data using the existing get_stock_history function
+    history = await get_stock_history(yf_ticker, period)
+    if history is None:
+        await interaction.followup.send(
+            "Unable to fetch cryptocurrency data. Make sure you're using a valid symbol (e.g. BTC, ETH).",
+            ephemeral=True,
+        )
+        return
+
+    # Create chart using existing chart creation logic
+    plt.figure(figsize=(10, 6))
+
+    if chart_type == "line":
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
+
+    elif chart_type == "candle":
+        import matplotlib.dates as mdates
+        from mplfinance.original_flavor import candlestick_ohlc
+
+        history["Date"] = mdates.date2num(history.index.to_pydatetime())
+        ohlc = history[["Date", "Open", "High", "Low", "Close"]].values
+        candlestick_ohlc(plt.gca(), ohlc, width=0.6, colorup="green", colordown="red")
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+
+    elif chart_type == "mountain":
+        plt.fill_between(history.index, history["Close"], alpha=0.3, color="blue")
+        plt.plot(history.index, history["Close"], color="blue", alpha=0.8)
+
+    elif chart_type == "baseline":
+        baseline = history["Close"].mean()
+        plt.fill_between(
+            history.index,
+            history["Close"],
+            baseline,
+            where=(history["Close"] >= baseline),
+            color="green",
+            alpha=0.3,
+        )
+        plt.fill_between(
+            history.index,
+            history["Close"],
+            baseline,
+            where=(history["Close"] < baseline),
+            color="red",
+            alpha=0.3,
+        )
+        plt.axhline(y=baseline, color="gray", linestyle="--")
+
+    plt.title(f"{ticker.upper()} {chart_type.title()} Chart ({period})")
+    plt.xlabel("Date/Time")
+    plt.ylabel("Price (USD)")
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+
+    # Add current price point
+    current_price = history["Close"].iloc[-1]
+    plt.scatter(history.index[-1], current_price, color="green", s=100, zorder=5)
+
+    plt.tight_layout()
+
+    # Save chart to buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    buf.seek(0)
+    plt.close()
+
+    # Create embed with price information
+    embed = discord.Embed(
+        title=f"{ticker.upper()} Price Chart", color=discord.Color.blue()
+    )
+
+    # Get current price info
+    price_change = history["Close"].iloc[-1] - history["Close"].iloc[0]
+    price_change_pct = (price_change / history["Close"].iloc[0]) * 100
+
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+    embed.add_field(
+        name="Change",
+        value=f"${price_change:,.2f} ({price_change_pct:,.2f}%)",
+        inline=True,
+    )
+    embed.add_field(name="Period", value=period, inline=True)
+    embed.add_field(name="Chart Type", value=chart_type.title(), inline=True)
+
+    # Send chart
+    file = discord.File(buf, filename=f"{ticker}_chart.png")
+    embed.set_image(url=f"attachment://{ticker}_chart.png")
+    await interaction.followup.send(file=file, embed=embed)
+
+
+@crypto_group.command(
+    name="lookup", description="Get information about a cryptocurrency"
+)
+@app_commands.describe(ticker="Crypto ticker symbol (e.g. BTC, ETH)")
+async def crypto_lookup_command(interaction: discord.Interaction, ticker: str):
+    await interaction.response.defer()  # Add this line to prevent timeout
+
+    info = await get_crypto_info(ticker.upper())
+    if not info:
+        await interaction.followup.send(  # Change to followup
+            "Invalid or unsupported cryptocurrency symbol. Only major cryptocurrencies are supported.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{info['name']} ({info['symbol']})",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+
+    # Add more debug information
+    print(f"Processing crypto info for {ticker}:")
+    print(f"Name: {info['name']}")
+    print(f"Symbol: {info['symbol']}")
+    print(f"Price: ${info['price']}")
+
+    embed.add_field(
+        name="Current Price",
+        value=f"${info['price']:,.2f}",
+        inline=False,
+    )
+
+    # Add 24h change if available
+    if info["price_change_24h"]:
+        embed.add_field(
+            name="24h Change",
+            value=f"{info['price_change_24h']:+.2f}%",
+            inline=True,
+        )
+
+    embed.add_field(
+        name="Market Cap",
+        value=f"${info['market_cap']:,.2f}",
+        inline=True,
+    )
+    embed.add_field(
+        name="24h Volume",
+        value=f"${info['volume_24h']:,.2f}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Circulating Supply",
+        value=f"{info['circulating_supply']:,.0f} {info['symbol']}",
+        inline=True,
+    )
+    if info["total_supply"]:
+        embed.add_field(
+            name="Total Supply",
+            value=f"{info['total_supply']:,.0f} {info['symbol']}",
+            inline=True,
+        )
+
+    await interaction.followup.send(embed=embed)  # Change to followup
 
 def main():
     bot.run(BOT_TOKEN)
