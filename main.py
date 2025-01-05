@@ -370,12 +370,10 @@ async def leaderboard_command(interaction: discord.Interaction):
     # sort desc
     leaderboard_data.sort(key=lambda x: x[1], reverse=True)
     # We'll let the view handle at most 10 pages, 5 per page => up to 50 users max
-    # if more than 50, the rest won't appear
 
     def leaderboard_embed_factory(
         page_index: int, total_pages: int, items_for_page: list
     ) -> discord.Embed:
-        # items_for_page is a slice of (user_id, net_worth)
         embed = discord.Embed(
             title=f"Leaderboard - Page {page_index+1}/{total_pages}",
             color=discord.Color.gold(),
@@ -388,6 +386,10 @@ async def leaderboard_command(interaction: discord.Interaction):
         embed.description = "\n".join(lines) if lines else "No data"
         return embed
 
+    if not leaderboard_data:
+        await interaction.response.send_message("No data available.")
+        return
+
     view = PaginatorView(
         items=leaderboard_data,
         items_per_page=5,
@@ -395,12 +397,6 @@ async def leaderboard_command(interaction: discord.Interaction):
         author_id=interaction.user.id,
         max_pages=10,  # at most 10 pages
     )
-
-    # If no data, show a quick message
-    if not leaderboard_data:
-        await interaction.response.send_message("No data available.")
-        return
-
     await view.send_first_page(interaction)
 
 
@@ -411,23 +407,13 @@ async def leaderboard_command(interaction: discord.Interaction):
     name="market", description="Show all stocks, 5 per page, grouped here."
 )
 async def market_command(interaction: discord.Interaction):
-    """
-    Displays a list of all stocks in pages of 5.
-    """
     cursor = bot.stock_collection.find({})
-    # We'll store (industry, ticker, price) and we'll show them in pages
-    # (We won't group them by industry in multiple fields - we'll do a simpler approach:
-    #  each item = "industry | ticker - $price"
-    #  so we can page easily.)
     market_data = []
     async for doc in cursor:
         industry = doc["industry"]
         ticker = doc["_id"]
         price = doc["price"]
         market_data.append((industry, ticker, price))
-
-    # sort by industry or ticker if you want
-    # market_data.sort(key=lambda x: (x[0], x[1]))
 
     def market_embed_factory(
         page_index: int, total_pages: int, items_for_page: list
@@ -457,7 +443,7 @@ async def market_command(interaction: discord.Interaction):
         items_per_page=5,
         embed_factory=market_embed_factory,
         author_id=interaction.user.id,
-        max_pages=None,  # unlimited pages
+        max_pages=None,
     )
     await view.send_first_page(interaction)
 
@@ -470,7 +456,6 @@ async def market_command(interaction: discord.Interaction):
     description="Show all published events (1 item per page, newest first).",
 )
 async def news_command(interaction: discord.Interaction):
-    # We'll get all events from newest -> oldest. Then we show 1 per page
     events_cursor = bot.events_collection.find({}).sort("timestamp", -1)
     events = []
     async for evt in events_cursor:
@@ -483,7 +468,6 @@ async def news_command(interaction: discord.Interaction):
     def news_embed_factory(
         page_index: int, total_pages: int, items_for_page: list
     ) -> discord.Embed:
-        # items_for_page will contain exactly 1 item: [evt]
         evt = items_for_page[0]
         time_str = evt["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
         impact = evt.get("impact", 0.0)
@@ -539,8 +523,6 @@ async def history_command(
     # newest first
     transactions.sort(key=lambda x: x["timestamp"], reverse=True)
 
-    # We'll store them as strings or store raw data
-    # Each item = (type, ticker, shares, price, timestamp)
     hist_data = []
     for tx in transactions:
         ts_str = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -557,9 +539,7 @@ async def history_command(
             title=f"{target.display_name}'s Transaction History (Page {page_index+1}/{total_pages})",
             color=discord.Color.purple(),
         )
-        embed.description = "\n\n".join(
-            items_for_page
-        )  # separate each transaction by a blank line
+        embed.description = "\n\n".join(items_for_page)
         return embed
 
     view = PaginatorView(
@@ -569,7 +549,6 @@ async def history_command(
         author_id=interaction.user.id,
         max_pages=None,
     )
-
     await view.send_first_page(interaction)
 
 
@@ -601,7 +580,7 @@ async def stock_command(interaction: discord.Interaction, ticker: str):
 
 
 #
-# NEW COMMAND: /stock_chart (unchanged from previous, but kept here)
+# /stock_chart command for generating a stock price chart
 #
 time_period_choices = Literal["1m", "1h", "1d", "5d", "10d", "1M"]
 
@@ -675,7 +654,7 @@ async def stock_chart_command(
 
 ##################################################
 # Owner-only Commands (create_stock, update_stock,
-# publish_event, earnings_report) remain unchanged
+# publish_event, earnings_report)
 ##################################################
 
 
@@ -833,12 +812,19 @@ async def publish_event_command(
     affected_tickers: Optional[str] = "",
     affected_industries: Optional[str] = "",
 ):
+    """
+    Allows specifying multiple tickers or industries, comma-separated.
+    Example:
+      affected_tickers="AAPL,TSLA,DRIN"
+      affected_industries="Technology,Energy"
+    """
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
             "Only the bot owner can use this command.", ephemeral=True
         )
         return
 
+    # Split comma-separated values, strip spaces, and uppercase tickers
     tickers_list = (
         [t.strip().upper() for t in affected_tickers.split(",") if t.strip()]
         if affected_tickers
@@ -859,6 +845,7 @@ async def publish_event_command(
         "timestamp": datetime.datetime.utcnow(),
     }
     await bot.events_collection.insert_one(doc)
+    # Optionally trigger immediate price update
     await bot.update_prices_algorithm(triggered_by_event=True)
 
     await interaction.response.send_message("Event published and prices updated.")
