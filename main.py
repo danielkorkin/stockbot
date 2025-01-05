@@ -257,9 +257,9 @@ async def get_stock_news(ticker: str) -> List[Dict]:
             # Convert timestamp to datetime with validation
             timestamp = item.get("providerPublishTime", 0)
             if timestamp:
-                published = datetime.datetime.fromtimestamp(timestamp)
+                published = datetime.fromtimestamp(timestamp)
             else:
-                published = datetime.datetime.utcnow()  # Fallback to current time
+                published = datetime.utcnow()  # Fallback to current time
 
             # Add only if we have valid title
             formatted_news.append(
@@ -303,7 +303,7 @@ async def add_pending_order(
             "ticker": ticker.upper(),
             "quantity": quantity,
             "price": price,
-            "created_at": datetime.datetime.utcnow(),
+            "created_at": datetime.utcnow(),
         }
 
         await bot.db[PENDING_ORDERS_COLLECTION].insert_one(order)
@@ -595,7 +595,7 @@ class AlertManager:
                     "shares": order["quantity"],
                     "price": current_price,
                     "total": total_cost,
-                    "timestamp": datetime.datetime.utcnow(),
+                    "timestamp": datetime.utcnow(),
                 }
 
                 await self.bot.user_collection.update_one(
@@ -653,7 +653,7 @@ class AlertManager:
                     "shares": order["quantity"],
                     "price": current_price,
                     "total": total_value,
-                    "timestamp": datetime.datetime.utcnow(),
+                    "timestamp": datetime.utcnow(),
                 }
 
                 await self.bot.user_collection.update_one(
@@ -1013,7 +1013,7 @@ async def stock_info_command(interaction: discord.Interaction, ticker: str):
     embed = discord.Embed(
         title=f"{info['name']} ({ticker.upper()})",
         color=discord.Color.blue(),
-        timestamp=datetime.datetime.utcnow(),  # Add timestamp
+        timestamp=datetime.utcnow(),  # Add timestamp
     )
 
     # Always show the most recent price first
@@ -1074,7 +1074,7 @@ async def stock_buy_command(interaction: discord.Interaction, ticker: str, share
         "shares": shares,
         "price": price,
         "total": total_cost,
-        "timestamp": datetime.datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
     }
 
     await bot.user_collection.update_one(
@@ -1134,7 +1134,7 @@ async def stock_sell_command(
         "shares": shares,
         "price": price,
         "total": total_value,
-        "timestamp": datetime.datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
     }
 
     await bot.user_collection.update_one(
@@ -1493,7 +1493,7 @@ async def stock_lookup_command(interaction: discord.Interaction, ticker: str):
     embed = discord.Embed(
         title=f"{info['name']} ({ticker.upper()})",
         color=discord.Color.blue(),
-        timestamp=datetime.datetime.utcnow(),
+        timestamp=datetime.utcnow(),
     )
 
     # Always show the most recent price first
@@ -1859,7 +1859,7 @@ async def stock_today_command(interaction: discord.Interaction):
         title="Market Overview",
         description=f"Market Status: {market_hours['status']}",
         color=discord.Color.blue(),
-        timestamp=datetime.datetime.utcnow(),
+        timestamp=datetime.utcnow(),
     )
 
     # If it's weekend, only show market hours
@@ -1942,7 +1942,7 @@ async def stock_today_command(interaction: discord.Interaction):
 
     # Add timestamp
     embed.set_footer(
-        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        text=f"Values updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
 
     await interaction.followup.send(embed=embed)
@@ -1963,11 +1963,9 @@ async def leaderboard_command(interaction: discord.Interaction):
                 # Get detailed portfolio value with real-time prices
                 portfolio_value, _, crypto_value = await calculate_portfolio_value(
                     user["portfolio"],
-                    user.get("crypto", {}),  # Add crypto portfolio
+                    user.get("crypto", {}),
                 )
-                total_value = (
-                    user["balance"] + portfolio_value + crypto_value
-                )  # Include crypto value
+                total_value = user["balance"] + portfolio_value + crypto_value
                 leaderboard.append((member, total_value))
         except discord.NotFound:
             continue
@@ -1986,9 +1984,9 @@ async def leaderboard_command(interaction: discord.Interaction):
             inline=False,
         )
 
-    # Add timestamp to show when values were last updated
+    # Fix this line to use datetime directly instead of datetime.datetime
     embed.set_footer(
-        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        text=f"Values updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
 
     await interaction.response.send_message(embed=embed)
@@ -2413,7 +2411,7 @@ async def crypto_buy_command(
         "amount": amount,
         "price": price,
         "total": total_cost,
-        "timestamp": datetime.datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
     }
 
     await bot.user_collection.update_one(
@@ -2479,7 +2477,7 @@ async def crypto_sell_command(
         "amount": amount,
         "price": price,
         "total": total_value,
-        "timestamp": datetime.datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
     }
 
     await bot.user_collection.update_one(
@@ -2634,7 +2632,7 @@ async def crypto_lookup_command(interaction: discord.Interaction, ticker: str):
     embed = discord.Embed(
         title=f"{info['name']} ({info['symbol']})",
         color=discord.Color.blue(),
-        timestamp=datetime.datetime.utcnow(),
+        timestamp=datetime.utcnow(),
     )
 
     # Add more debug information
@@ -2761,7 +2759,7 @@ async def balance_command(
 
     # Add timestamp to show when values were last updated
     embed.set_footer(
-        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        text=f"Values updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
 
     await interaction.response.send_message(embed=embed)
@@ -2814,7 +2812,7 @@ class SellAllConfirmModal(discord.ui.Modal, title="Confirm Sell All"):
                     "shares": shares,
                     "price": price,
                     "total": price * shares,
-                    "timestamp": datetime.datetime.utcnow(),
+                    "timestamp": datetime.utcnow(),
                 }
             )
 
@@ -2828,7 +2826,7 @@ class SellAllConfirmModal(discord.ui.Modal, title="Confirm Sell All"):
                     "amount": amount,
                     "price": price,
                     "total": price * amount,
-                    "timestamp": datetime.datetime.utcnow(),
+                    "timestamp": datetime.utcnow(),
                 }
             )
 
