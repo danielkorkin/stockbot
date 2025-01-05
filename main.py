@@ -131,6 +131,7 @@ class StockBot(commands.Bot):
         self.db = None
         self.user_collection = None
         self.alert_manager = AlertManager()
+        # Remove the stock_group addition from here
 
     async def setup_hook(self):
         try:
@@ -153,6 +154,7 @@ class StockBot(commands.Bot):
         self.user_collection = self.db["users"]
 
         self.alert_manager.start_monitoring(self)
+        self.tree.add_command(stock_group)  # Move it here instead
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
@@ -457,36 +459,131 @@ async def get_top_stocks() -> List[Dict]:  # Change this line
         return []
 
 
-bot = StockBot()
+# Define the stock group and its commands
+stock_group = app_commands.Group(name="stock", description="Stock related commands")
 
 
-@bot.tree.command(name="balance", description="Show your cash balance.")
-async def balance_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    balance = round(user_data["balance"], 2)
+@stock_group.command(name="alert", description="Set a price alert for a stock")
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    price="Target price (positive for above, negative for below)",
+)
+async def alert_command(interaction: discord.Interaction, ticker: str, price: float):
+    """Set a price alert. Use positive price for above alerts, negative for below alerts."""
+    ticker = ticker.upper()
 
-    # Get detailed portfolio value
-    portfolio_value, _ = await calculate_portfolio_value(user_data["portfolio"])
-    total_value = round(balance + portfolio_value, 2)
+    # Verify the ticker exists
+    current_price = await get_stock_price(ticker)
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
 
-    embed = discord.Embed(title="Balance Sheet", color=discord.Color.green())
-    embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
-    embed.add_field(
-        name="Portfolio Value", value=f"${portfolio_value:,.2f}", inline=True
+    # Add the alert
+    bot.alert_manager.add_alert(ticker, interaction.user.id, interaction.channel, price)
+
+    alert_type = "above" if price >= 0 else "below"
+    embed = discord.Embed(
+        title="Price Alert Set",
+        description=f"You will be notified when {ticker} goes {alert_type} ${abs(price):,.2f}",
+        color=discord.Color.green(),
     )
-    embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
-
-    # Add timestamp to show when values were last updated
-    embed.set_footer(
-        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+    embed.add_field(
+        name="Target Price", value=f"${abs(price):,.2f} ({alert_type})", inline=True
     )
 
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="buy", description="Buy shares of a stock.")
+@stock_group.command(name="alerts", description="View or clear your price alerts")
+@app_commands.describe(
+    ticker="Stock ticker to clear alerts for (optional)",
+    clear="Whether to clear the alerts for the specified ticker",
+)
+async def alerts_command(
+    interaction: discord.Interaction, ticker: Optional[str] = None, clear: bool = False
+):
+    """View or clear your price alerts."""
+    if ticker and clear:
+        ticker = ticker.upper()
+        removed = bot.alert_manager.remove_alerts(ticker, interaction.user.id)
+        if removed:
+            await interaction.response.send_message(
+                f"Cleared {len(removed)} alert(s) for {ticker}."
+            )
+        else:
+            await interaction.response.send_message(
+                f"No alerts found for {ticker}.", ephemeral=True
+            )
+        return
+
+    # Show all alerts
+    embed = discord.Embed(title="Your Price Alerts", color=discord.Color.blue())
+    alerts_found = False
+
+    for t, alerts in bot.alert_manager.alerts.items():
+        user_alerts = [a for a in alerts if a[0] == interaction.user.id]
+        if user_alerts:
+            alerts_found = True
+            alert_texts = []
+            for _, _, price in user_alerts:
+                alert_type = "above" if price >= 0 else "below"
+                alert_texts.append(f"${abs(price):,.2f} ({alert_type})")
+            embed.add_field(name=t, value="\n".join(alert_texts), inline=False)
+
+    if not alerts_found:
+        embed.description = "You have no active price alerts."
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(name="info", description="Get information about a stock")
+@app_commands.describe(ticker="Ticker symbol")
+async def stock_info_command(interaction: discord.Interaction, ticker: str):
+    # This is the renamed original 'stock' command
+    info = await get_stock_info(ticker.upper())
+    if not info:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{info['name']} ({ticker.upper()})",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.utcnow(),  # Add timestamp
+    )
+
+    # Always show the most recent price first
+    embed.add_field(
+        name="Current Price",
+        value=f"${info['price']:,.2f} ({info['market_status']})",
+        inline=False,
+    )
+
+    # Show other prices if available
+    if info["market_status"] != "Regular Hours" and info["regular_price"]:
+        embed.add_field(
+            name="Regular Hours", value=f"${info['regular_price']:,.2f}", inline=True
+        )
+
+    embed.add_field(name="Market Cap", value=f"${info['market_cap']:,.2f}", inline=True)
+    embed.add_field(name="P/E Ratio", value=f"{info['pe_ratio']:.2f}", inline=True)
+    embed.add_field(
+        name="Dividend Yield", value=f"{info['dividend_yield']:.2f}%", inline=True
+    )
+    embed.add_field(name="Sector", value=info["sector"], inline=True)
+    embed.add_field(name="Volume", value=f"{info['volume']:,}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(name="buy", description="Buy shares of a stock")
 @app_commands.describe(ticker="Ticker symbol", shares="Number of shares to buy")
-async def buy_command(interaction: discord.Interaction, ticker: str, shares: int):
+async def stock_buy_command(interaction: discord.Interaction, ticker: str, shares: int):
+    # Move existing buy command code here
     if shares <= 0:
         await interaction.response.send_message(
             "Please enter a positive number of shares.", ephemeral=True
@@ -538,9 +635,12 @@ async def buy_command(interaction: discord.Interaction, ticker: str, shares: int
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="sell", description="Sell shares of a stock.")
+@stock_group.command(name="sell", description="Sell shares of a stock")
 @app_commands.describe(ticker="Ticker symbol", shares="Number of shares to sell")
-async def sell_command(interaction: discord.Interaction, ticker: str, shares: int):
+async def stock_sell_command(
+    interaction: discord.Interaction, ticker: str, shares: int
+):
+    # Move existing sell command code here
     if shares <= 0:
         await interaction.response.send_message(
             "Please enter a positive number of shares.", ephemeral=True
@@ -595,227 +695,7 @@ async def sell_command(interaction: discord.Interaction, ticker: str, shares: in
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="portfolio", description="Show your portfolio.")
-async def portfolio_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    portfolio = user_data["portfolio"]
-
-    if not portfolio:
-        await interaction.response.send_message(
-            "Your portfolio is empty.", ephemeral=True
-        )
-        return
-
-    embed = discord.Embed(title="Your Portfolio", color=discord.Color.blue())
-    total_value = 0.0
-
-    # Get detailed portfolio value with price info
-    portfolio_value, price_info = await calculate_portfolio_value(portfolio)
-
-    for ticker, shares in portfolio.items():
-        if ticker in price_info:
-            info = price_info[ticker]
-            value = info["total_value"]
-            total_value += value
-
-            # Add market status to each holding
-            embed.add_field(
-                name=ticker,
-                value=f"{shares} shares @ ${info['price']:,.2f} each ({info['market_status']})\n"
-                f"Value: ${value:,.2f}",
-                inline=False,
-            )
-
-    embed.add_field(
-        name="Total Portfolio Value", value=f"${total_value:,.2f}", inline=False
-    )
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="stock", description="Get information about a stock.")
-@app_commands.describe(ticker="Ticker symbol")
-async def stock_command(interaction: discord.Interaction, ticker: str):
-    info = await get_stock_info(ticker.upper())
-    if not info:
-        await interaction.response.send_message(
-            "Invalid ticker symbol.", ephemeral=True
-        )
-        return
-
-    embed = discord.Embed(
-        title=f"{info['name']} ({ticker.upper()})",
-        color=discord.Color.blue(),
-        timestamp=datetime.datetime.utcnow(),  # Add timestamp
-    )
-
-    # Always show the most recent price first
-    embed.add_field(
-        name="Current Price",
-        value=f"${info['price']:,.2f} ({info['market_status']})",
-        inline=False,
-    )
-
-    # Show other prices if available
-    if info["market_status"] != "Regular Hours" and info["regular_price"]:
-        embed.add_field(
-            name="Regular Hours", value=f"${info['regular_price']:,.2f}", inline=True
-        )
-
-    embed.add_field(name="Market Cap", value=f"${info['market_cap']:,.2f}", inline=True)
-    embed.add_field(name="P/E Ratio", value=f"{info['pe_ratio']:.2f}", inline=True)
-    embed.add_field(
-        name="Dividend Yield", value=f"{info['dividend_yield']:.2f}%", inline=True
-    )
-    embed.add_field(name="Sector", value=info["sector"], inline=True)
-    embed.add_field(name="Volume", value=f"{info['volume']:,}", inline=True)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="history", description="Show your transaction history.")
-async def history_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    transactions = user_data["transactions"]
-
-    if not transactions:
-        await interaction.response.send_message(
-            "You have no transaction history.", ephemeral=True
-        )
-        return
-
-    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
-    embed = discord.Embed(title="Transaction History", color=discord.Color.purple())
-    for tx in transactions:
-        timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
-        embed.add_field(
-            name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
-            value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="leaderboard", description="Show the top users by net worth.")
-async def leaderboard_command(interaction: discord.Interaction):
-    users = bot.user_collection.find({})
-    leaderboard = []
-
-    async for user in users:
-        try:
-            member = await interaction.guild.fetch_member(user["_id"])
-            if member:
-                # Get detailed portfolio value with real-time prices
-                portfolio_value, _ = await calculate_portfolio_value(user["portfolio"])
-                total_value = user["balance"] + portfolio_value
-                leaderboard.append((member, total_value))
-        except discord.NotFound:
-            continue
-
-    if not leaderboard:
-        await interaction.response.send_message("No users found.", ephemeral=True)
-        return
-
-    leaderboard.sort(key=lambda x: x[1], reverse=True)
-    embed = discord.Embed(title="Leaderboard", color=discord.Color.gold())
-
-    for rank, (member, net_worth) in enumerate(leaderboard[:10], start=1):
-        embed.add_field(
-            name=f"{rank}. {member.display_name}",
-            value=f"Net Worth: ${net_worth:,.2f}",
-            inline=False,
-        )
-
-    # Add timestamp to show when values were last updated
-    embed.set_footer(
-        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(
-    name="top", description="Show top 50 stocks by market cap (10 pages, 5 per page)"
-)
-async def top_command(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    stocks = await get_top_stocks()
-    if not stocks:
-        await interaction.followup.send("Unable to fetch stock data.", ephemeral=True)
-        return
-
-    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
-        embed = discord.Embed(
-            title=f"Top Stocks by Market Cap (Page {page_idx + 1}/{total_pages})",
-            color=discord.Color.blue(),
-        )
-
-        for i, stock in enumerate(subset, start=page_idx * 5 + 1):
-            market_cap_b = stock["market_cap"] / 1_000_000_000  # Convert to billions
-            embed.add_field(
-                name=f"#{i}. {stock['ticker']}",
-                value=f"**{stock['name']}**\nPrice: ${stock['price']:,.2f}\nMarket Cap: ${market_cap_b:.1f}B",
-                inline=False,
-            )
-
-        return embed
-
-    view = PaginatorView(stocks, 5, embed_factory, interaction.user.id, max_pages=10)
-    await view.send_first_page(interaction.followup, is_followup=True)
-
-
-async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
-    try:
-        stock = yf.Ticker(ticker)
-
-        # Update period and interval mappings for better short-term data
-        period_map = {
-            "1mo": "1mo",
-            "3mo": "3mo",
-            "6mo": "6mo",
-            "1y": "1y",
-            "2y": "2y",
-            "5y": "5y",
-            "max": "max",
-        }
-
-        interval_map = {
-            "1mo": "1d",  # Daily data for 1 month
-            "3mo": "1d",  # Daily data for 3 months
-            "6mo": "1d",  # Daily data for 6 months
-            "1y": "1d",  # Daily data for 1 year
-            "2y": "1d",  # Daily data for 2 years
-            "5y": "1wk",  # Weekly data for 5 years
-            "max": "1mo",  # Monthly data for max period
-        }
-
-        yf_period = period_map.get(period, "1mo")
-        yf_interval = interval_map.get(period, "1d")
-
-        print(
-            f"Fetching data for {ticker} with period: {yf_period}, interval: {yf_interval}"
-        )
-
-        # Get historical data
-        history = stock.history(period=yf_period, interval=yf_interval, prepost=True)
-
-        if history.empty:
-            print(f"No data returned for {ticker}")
-            return None
-
-        # Print data info for debugging
-        print(f"Fetched {len(history)} data points")
-        print(f"Date range: {history.index[0]} to {history.index[-1]}")
-
-        return history
-
-    except Exception as e:
-        print(f"Error getting history for {ticker}: {e}")
-        return None
-
-
-@bot.tree.command(name="chart", description="Show price chart for a stock")
+@stock_group.command(name="chart", description="Show price chart for a stock")
 @app_commands.describe(
     ticker="Ticker symbol",
     period="Time period (1min,5min,1h,12h,1d,5d,1mo,1y,ytd,5y,max)",
@@ -855,9 +735,10 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
         ]
     ],
 )
-async def chart_command(
+async def stock_chart_command(
     interaction: discord.Interaction, ticker: str, period: str, chart_type: str = "line"
 ):
+    # Move existing chart command code here
     await interaction.response.defer()
 
     history = await get_stock_history(ticker.upper(), period)
@@ -1015,36 +896,10 @@ async def chart_command(
     await interaction.followup.send(file=file, embed=embed)
 
 
-async def get_stock_news(ticker: str) -> List[Dict]:
-    try:
-        stock = yf.Ticker(ticker)
-        news = stock.news
-        if not news:
-            return []
-
-        # Format the news items
-        formatted_news = []
-        for item in news[:5]:  # Get latest 5 news items
-            formatted_news.append(
-                {
-                    "title": item.get("title", "No title"),
-                    "publisher": item.get("publisher", "Unknown"),
-                    "link": item.get("link", "#"),
-                    "published": datetime.datetime.fromtimestamp(
-                        item.get("providerPublishTime", 0)
-                    ),
-                    "summary": item.get("summary", "No summary available"),
-                }
-            )
-        return formatted_news
-    except Exception as e:
-        print(f"Error getting news for {ticker}: {e}")
-        return []
-
-
-@bot.tree.command(name="news", description="Show latest news for a stock")
+@stock_group.command(name="news", description="Show latest news for a stock")
 @app_commands.describe(ticker="Ticker symbol")
-async def news_command(interaction: discord.Interaction, ticker: str):
+async def stock_news_command(interaction: discord.Interaction, ticker: str):
+    # Move existing news command code here
     await interaction.response.defer()
 
     news_items = await get_stock_news(ticker.upper())
@@ -1077,6 +932,255 @@ async def news_command(interaction: discord.Interaction, ticker: str):
 
     view = PaginatorView(news_items, 1, embed_factory, interaction.user.id)
     await view.send_first_page(interaction.followup, is_followup=True)
+
+
+@stock_group.command(name="strategy", description="Test a Pine trading strategy")
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    period="Time period for backtest",
+    initial_amount="Initial investment amount",
+    algorithm_url="Optional: URL to raw algorithm code (e.g., GitHub raw link)",
+)
+@app_commands.choices(
+    period=[
+        app_commands.Choice(name=p, value=p)
+        for p in ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
+    ]
+)
+async def stock_strategy_command(
+    interaction: discord.Interaction,
+    ticker: str,
+    period: str,
+    initial_amount: float,
+    algorithm_url: str = None,
+):
+    # Move existing strategy command code here
+    view = PineStrategyView(ticker.upper(), period, initial_amount)
+
+    if algorithm_url:
+        # Verify URL format
+        if not algorithm_url.startswith(("http://", "https://")):
+            await interaction.response.send_message(
+                "Invalid URL format. Please provide a valid HTTP(S) URL.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        algorithm_code = await fetch_algorithm_code(algorithm_url)
+        if algorithm_code is None:
+            await interaction.followup.send(
+                "Failed to fetch valid algorithm code. Please ensure the URL points to a raw Pine script.",
+                ephemeral=True,
+            )
+            return
+
+        view.pine_code = algorithm_code
+        await view.execute_strategy(interaction)
+    else:
+        # Show the modal for manual code input
+        modal = PineStrategyModal()
+        modal.view = view
+        await interaction.response.send_modal(modal)
+
+
+@stock_group.command(
+    name="top", description="Show top 50 stocks by market cap (10 pages, 5 per page)"
+)
+async def stock_top_command(interaction: discord.Interaction):
+    # Move existing top command code here
+    await interaction.response.defer()
+
+    stocks = await get_top_stocks()
+    if not stocks:
+        await interaction.followup.send("Unable to fetch stock data.", ephemeral=True)
+        return
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Top Stocks by Market Cap (Page {page_idx + 1}/{total_pages})",
+            color=discord.Color.blue(),
+        )
+
+        for i, stock in enumerate(subset, start=page_idx * 5 + 1):
+            market_cap_b = stock["market_cap"] / 1_000_000_000  # Convert to billions
+            embed.add_field(
+                name=f"#{i}. {stock['ticker']}",
+                value=f"**{stock['name']}**\nPrice: ${stock['price']:,.2f}\nMarket Cap: ${market_cap_b:.1f}B",
+                inline=False,
+            )
+
+        return embed
+
+    view = PaginatorView(stocks, 5, embed_factory, interaction.user.id, max_pages=10)
+    await view.send_first_page(interaction.followup, is_followup=True)
+
+
+@stock_group.command(name="lookup", description="Get information about a stock")
+@app_commands.describe(ticker="Ticker symbol")
+async def stock_lookup_command(interaction: discord.Interaction, ticker: str):
+    info = await get_stock_info(ticker.upper())
+    if not info:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{info['name']} ({ticker.upper()})",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+
+    # Always show the most recent price first
+    embed.add_field(
+        name="Current Price",
+        value=f"${info['price']:,.2f} ({info['market_status']})",
+        inline=False,
+    )
+
+    # Show other prices if available
+    if info["market_status"] != "Regular Hours" and info["regular_price"]:
+        embed.add_field(
+            name="Regular Hours", value=f"${info['regular_price']:,.2f}", inline=True
+        )
+
+    embed.add_field(name="Market Cap", value=f"${info['market_cap']:,.2f}", inline=True)
+    embed.add_field(name="P/E Ratio", value=f"{info['pe_ratio']:.2f}", inline=True)
+    embed.add_field(
+        name="Dividend Yield", value=f"{info['dividend_yield']:.2f}%", inline=True
+    )
+    embed.add_field(name="Sector", value=info["sector"], inline=True)
+    embed.add_field(name="Volume", value=f"{info['volume']:,}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+bot = StockBot()
+
+
+@bot.tree.command(name="balance", description="Show your cash balance.")
+async def balance_command(interaction: discord.Interaction):
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    balance = round(user_data["balance"], 2)
+
+    # Get detailed portfolio value
+    portfolio_value, _ = await calculate_portfolio_value(user_data["portfolio"])
+    total_value = round(balance + portfolio_value, 2)
+
+    embed = discord.Embed(title="Balance Sheet", color=discord.Color.green())
+    embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
+    embed.add_field(
+        name="Portfolio Value", value=f"${portfolio_value:,.2f}", inline=True
+    )
+    embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
+
+    # Add timestamp to show when values were last updated
+    embed.set_footer(
+        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="portfolio", description="Show your portfolio.")
+async def portfolio_command(interaction: discord.Interaction):
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    portfolio = user_data["portfolio"]
+
+    if not portfolio:
+        await interaction.response.send_message(
+            "Your portfolio is empty.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(title="Your Portfolio", color=discord.Color.blue())
+    total_value = 0.0
+
+    # Get detailed portfolio value with price info
+    portfolio_value, price_info = await calculate_portfolio_value(portfolio)
+
+    for ticker, shares in portfolio.items():
+        if ticker in price_info:
+            info = price_info[ticker]
+            value = info["total_value"]
+            total_value += value
+
+            # Add market status to each holding
+            embed.add_field(
+                name=ticker,
+                value=f"{shares} shares @ ${info['price']:,.2f} each ({info['market_status']})\n"
+                f"Value: ${value:,.2f}",
+                inline=False,
+            )
+
+    embed.add_field(
+        name="Total Portfolio Value", value=f"${total_value:,.2f}", inline=False
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="history", description="Show your transaction history.")
+async def history_command(interaction: discord.Interaction):
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    transactions = user_data["transactions"]
+
+    if not transactions:
+        await interaction.response.send_message(
+            "You have no transaction history.", ephemeral=True
+        )
+        return
+
+    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
+    embed = discord.Embed(title="Transaction History", color=discord.Color.purple())
+    for tx in transactions:
+        timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
+        embed.add_field(
+            name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
+            value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="leaderboard", description="Show the top users by net worth.")
+async def leaderboard_command(interaction: discord.Interaction):
+    users = bot.user_collection.find({})
+    leaderboard = []
+
+    async for user in users:
+        try:
+            member = await interaction.guild.fetch_member(user["_id"])
+            if member:
+                # Get detailed portfolio value with real-time prices
+                portfolio_value, _ = await calculate_portfolio_value(user["portfolio"])
+                total_value = user["balance"] + portfolio_value
+                leaderboard.append((member, total_value))
+        except discord.NotFound:
+            continue
+
+    if not leaderboard:
+        await interaction.response.send_message("No users found.", ephemeral=True)
+        return
+
+    leaderboard.sort(key=lambda x: x[1], reverse=True)
+    embed = discord.Embed(title="Leaderboard", color=discord.Color.gold())
+
+    for rank, (member, net_worth) in enumerate(leaderboard[:10], start=1):
+        embed.add_field(
+            name=f"{rank}. {member.display_name}",
+            value=f"Net Worth: ${net_worth:,.2f}",
+            inline=False,
+        )
+
+    # Add timestamp to show when values were last updated
+    embed.set_footer(
+        text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="resync", description="Resync all slash commands (Owner Only)")
@@ -1442,132 +1546,6 @@ async def fetch_algorithm_code(url: str) -> Optional[str]:
     except Exception as e:
         print(f"Error fetching algorithm code: {e}")
         return None
-
-
-@bot.tree.command(name="strategy", description="Test a Pine trading strategy")
-@app_commands.describe(
-    ticker="Stock ticker symbol",
-    period="Time period for backtest",
-    initial_amount="Initial investment amount",
-    algorithm_url="Optional: URL to raw algorithm code (e.g., GitHub raw link)",
-)
-@app_commands.choices(
-    period=[
-        app_commands.Choice(name=p, value=p)
-        for p in ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
-    ]
-)
-async def strategy_command(
-    interaction: discord.Interaction,
-    ticker: str,
-    period: str,
-    initial_amount: float,
-    algorithm_url: str = None,
-):
-    view = PineStrategyView(ticker.upper(), period, initial_amount)
-
-    if algorithm_url:
-        # Verify URL format
-        if not algorithm_url.startswith(("http://", "https://")):
-            await interaction.response.send_message(
-                "Invalid URL format. Please provide a valid HTTP(S) URL.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-
-        algorithm_code = await fetch_algorithm_code(algorithm_url)
-        if algorithm_code is None:
-            await interaction.followup.send(
-                "Failed to fetch valid algorithm code. Please ensure the URL points to a raw Pine script.",
-                ephemeral=True,
-            )
-            return
-
-        view.pine_code = algorithm_code
-        await view.execute_strategy(interaction)
-    else:
-        # Show the modal for manual code input
-        modal = PineStrategyModal()
-        modal.view = view
-        await interaction.response.send_modal(modal)
-
-
-@bot.tree.command(name="alert", description="Set a price alert for a stock")
-@app_commands.describe(
-    ticker="Stock ticker symbol",
-    price="Target price (positive for above, negative for below)",
-)
-async def alert_command(interaction: discord.Interaction, ticker: str, price: float):
-    """Set a price alert. Use positive price for above alerts, negative for below alerts."""
-    ticker = ticker.upper()
-
-    # Verify the ticker exists
-    current_price = await get_stock_price(ticker)
-    if current_price is None:
-        await interaction.response.send_message(
-            "Invalid ticker symbol.", ephemeral=True
-        )
-        return
-
-    # Add the alert
-    bot.alert_manager.add_alert(ticker, interaction.user.id, interaction.channel, price)
-
-    alert_type = "above" if price >= 0 else "below"
-    embed = discord.Embed(
-        title="Price Alert Set",
-        description=f"You will be notified when {ticker} goes {alert_type} ${abs(price):,.2f}",
-        color=discord.Color.green(),
-    )
-    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
-    embed.add_field(
-        name="Target Price", value=f"${abs(price):,.2f} ({alert_type})", inline=True
-    )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="alerts", description="View or clear your price alerts")
-@app_commands.describe(
-    ticker="Stock ticker to clear alerts for (optional)",
-    clear="Whether to clear the alerts for the specified ticker",
-)
-async def alerts_command(
-    interaction: discord.Interaction, ticker: Optional[str] = None, clear: bool = False
-):
-    """View or clear your price alerts."""
-    if ticker and clear:
-        ticker = ticker.upper()
-        removed = bot.alert_manager.remove_alerts(ticker, interaction.user.id)
-        if removed:
-            await interaction.response.send_message(
-                f"Cleared {len(removed)} alert(s) for {ticker}."
-            )
-        else:
-            await interaction.response.send_message(
-                f"No alerts found for {ticker}.", ephemeral=True
-            )
-        return
-
-    # Show all alerts
-    embed = discord.Embed(title="Your Price Alerts", color=discord.Color.blue())
-    alerts_found = False
-
-    for t, alerts in bot.alert_manager.alerts.items():
-        user_alerts = [a for a in alerts if a[0] == interaction.user.id]
-        if user_alerts:
-            alerts_found = True
-            alert_texts = []
-            for _, _, price in user_alerts:
-                alert_type = "above" if price >= 0 else "below"
-                alert_texts.append(f"${abs(price):,.2f} ({alert_type})")
-            embed.add_field(name=t, value="\n".join(alert_texts), inline=False)
-
-    if not alerts_found:
-        embed.description = "You have no active price alerts."
-
-    await interaction.response.send_message(embed=embed)
 
 
 def main():
