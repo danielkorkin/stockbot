@@ -108,7 +108,9 @@ class PaginatorView(discord.ui.View):
 
 class StockBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = False
+        super().__init__(command_prefix="!", intents=intents)
         self.db = None
         self.user_collection = None
 
@@ -129,20 +131,33 @@ class StockBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching, name="the Stock Market"
+            )
+        )
 
 
 async def get_stock_price(ticker: str) -> Optional[float]:
     try:
         stock = yf.Ticker(ticker)
-        # Try multiple price attributes in case some are missing
-        price = (
-            stock.info.get("regularMarketPrice")
-            or stock.info.get("currentPrice")
-            or stock.info.get("previousClose")
-        )
-        if price:
-            return float(price)
-        return None
+        info = stock.info
+
+        # Get regular market price first
+        price = info.get("regularMarketPrice")
+
+        # Check for pre-market price
+        pre_market = info.get("preMarketPrice")
+        if pre_market:
+            return float(pre_market)
+
+        # Check for after-hours price
+        post_market = info.get("postMarketPrice")
+        if post_market:
+            return float(post_market)
+
+        # Fallback to regular price or previous close
+        return float(price or info.get("previousClose", 0))
     except Exception as e:
         print(f"Error getting price for {ticker}: {e}")
         return None
@@ -153,29 +168,40 @@ async def get_stock_info(ticker: str) -> Optional[Dict]:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # Get price using multiple fallback options
-        price = (
-            info.get("regularMarketPrice")
-            or info.get("currentPrice")
-            or info.get("previousClose")
-        )
+        # Get all market prices
+        regular_price = info.get("regularMarketPrice", 0.0)
+        pre_market = info.get("preMarketPrice")
+        post_market = info.get("postMarketPrice")
+
+        # Determine current price based on market hours
+        current_price = regular_price
+        market_status = "Regular Hours"
+
+        if pre_market:
+            current_price = pre_market
+            market_status = "Pre-Market"
+        elif post_market:
+            current_price = post_market
+            market_status = "After-Hours"
 
         # Get market cap with fallback
         market_cap = info.get("marketCap") or info.get("totalMarketCap")
 
-        # Get PE ratio with fallback
+        # Other data...
         pe_ratio = info.get("forwardPE") or info.get("trailingPE") or 0.0
-
-        # Get dividend yield with fallback
         div_yield = (
             info.get("dividendYield") or info.get("trailingAnnualDividendYield") or 0.0
         )
         if div_yield:
-            div_yield = div_yield * 100  # Convert to percentage
+            div_yield = div_yield * 100
 
         return {
             "name": info.get("longName") or info.get("shortName", "Unknown"),
-            "price": float(price) if price else 0.0,
+            "price": float(current_price),
+            "market_status": market_status,
+            "regular_price": float(regular_price) if regular_price else 0.0,
+            "pre_market": float(pre_market) if pre_market else None,
+            "post_market": float(post_market) if post_market else None,
             "market_cap": float(market_cap) if market_cap else 0,
             "pe_ratio": float(pe_ratio),
             "dividend_yield": float(div_yield),
@@ -477,7 +503,23 @@ async def stock_command(interaction: discord.Interaction, ticker: str):
     embed = discord.Embed(
         title=f"{info['name']} ({ticker.upper()})", color=discord.Color.blue()
     )
-    embed.add_field(name="Price", value=f"${info['price']:,.2f}", inline=True)
+
+    # Price field with market status
+    price_text = f"${info['price']:,.2f} ({info['market_status']})"
+    if info["market_status"] != "Regular Hours":
+        price_text += f"\nRegular Hours: ${info['regular_price']:,.2f}"
+    embed.add_field(name="Price", value=price_text, inline=True)
+
+    # Add pre/post market prices if available
+    if info["pre_market"]:
+        embed.add_field(
+            name="Pre-Market", value=f"${info['pre_market']:,.2f}", inline=True
+        )
+    if info["post_market"]:
+        embed.add_field(
+            name="After-Hours", value=f"${info['post_market']:,.2f}", inline=True
+        )
+
     embed.add_field(name="Market Cap", value=f"${info['market_cap']:,.2f}", inline=True)
     embed.add_field(name="P/E Ratio", value=f"{info['pe_ratio']:.2f}", inline=True)
     embed.add_field(
@@ -563,6 +605,153 @@ async def top_command(interaction: discord.Interaction):
 
     view = PaginatorView(stocks, 5, embed_factory, interaction.user.id, max_pages=10)
     await view.send_first_page(interaction.followup, is_followup=True)
+
+
+async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
+    try:
+        stock = yf.Ticker(ticker)
+
+        period_map = {
+            "1min": "1d",  # 1 minute data for 1 day
+            "5min": "1d",  # 5 minute data for 1 day
+            "1h": "1d",  # 1 hour data for 1 day
+            "12h": "5d",  # hourly data for 5 days
+            "1d": "1d",  # daily data for 1 day
+            "5d": "5d",  # daily data for 5 days
+            "1mo": "1mo",  # daily data for 1 month
+            "1y": "1y",  # daily data for 1 year
+            "ytd": "ytd",  # daily data year to date
+            "5y": "5y",  # daily data for 5 years
+            "max": "max",  # all available data
+        }
+
+        interval_map = {
+            "1min": "1m",
+            "5min": "5m",
+            "1h": "1h",
+            "12h": "1h",
+            "1d": "1m",  # Changed to 1m to get more detailed data
+            "5d": "1h",  # Changed to 1h for better resolution
+            "1mo": "1d",
+            "1y": "1d",
+            "ytd": "1d",
+            "5y": "1d",
+            "max": "1d",
+        }
+
+        yf_period = period_map.get(period, "1d")
+        yf_interval = interval_map.get(period, "1d")
+
+        # Include pre/post market data
+        history = stock.history(
+            period=yf_period,
+            interval=yf_interval,
+            prepost=True,  # Include pre/post market data
+        )
+
+        if history.empty:
+            return None
+
+        return history
+    except Exception as e:
+        print(f"Error getting history for {ticker}: {e}")
+        return None
+
+
+@bot.tree.command(name="chart", description="Show price chart for a stock")
+@app_commands.describe(
+    ticker="Ticker symbol",
+    period="Time period (1min,5min,1h,12h,1d,5d,1mo,1y,ytd,5y,max)",
+)
+@app_commands.choices(
+    period=[
+        app_commands.Choice(name=p, value=p)
+        for p in [
+            "1min",
+            "5min",
+            "1h",
+            "12h",
+            "1d",
+            "5d",
+            "1mo",
+            "1y",
+            "ytd",
+            "5y",
+            "max",
+        ]
+    ]
+)
+async def chart_command(interaction: discord.Interaction, ticker: str, period: str):
+    await interaction.response.defer()
+
+    history = await get_stock_history(ticker.upper(), period)
+    if history is None:
+        await interaction.followup.send("Unable to fetch stock data.", ephemeral=True)
+        return
+
+    # Create the chart
+    plt.figure(figsize=(10, 6))
+
+    # Plot regular market hours in blue
+    plt.plot(
+        history.index, history["Close"], color="blue", label="Regular Hours", alpha=0.8
+    )
+
+    # If we have pre/post market data, it will be included in the same line
+    # but we can highlight the current price point
+    current_price = history["Close"].iloc[-1]
+    plt.scatter(history.index[-1], current_price, color="green", s=100, zorder=5)
+
+    plt.title(f"{ticker.upper()} Price Chart ({period})")
+    plt.xlabel("Date/Time")
+    plt.ylabel("Price (USD)")
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.tight_layout()
+
+    # Save to buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    buf.seek(0)
+    plt.close()
+
+    # Get current stock info for pre/post market data
+    stock_info = await get_stock_info(ticker.upper())
+
+    # Create embed with stock info
+    price_change = history["Close"].iloc[-1] - history["Close"].iloc[0]
+    price_change_pct = (price_change / history["Close"].iloc[0]) * 100
+
+    embed = discord.Embed(
+        title=f"{ticker.upper()} Price Chart", color=discord.Color.blue()
+    )
+
+    # Show current price with market status
+    price_text = f"${current_price:,.2f} ({stock_info['market_status']})"
+    embed.add_field(name="Current Price", value=price_text, inline=True)
+
+    # Add pre/post market prices if available
+    if stock_info["pre_market"]:
+        embed.add_field(
+            name="Pre-Market", value=f"${stock_info['pre_market']:,.2f}", inline=True
+        )
+    if stock_info["post_market"]:
+        embed.add_field(
+            name="After-Hours", value=f"${stock_info['post_market']:,.2f}", inline=True
+        )
+
+    embed.add_field(
+        name="Change",
+        value=f"${price_change:,.2f} ({price_change_pct:,.2f}%)",
+        inline=True,
+    )
+    embed.add_field(name="Period", value=period, inline=True)
+
+    # Send the chart
+    file = discord.File(buf, filename=f"{ticker}_chart.png")
+    embed.set_image(url=f"attachment://{ticker}_chart.png")
+    await interaction.followup.send(file=file, embed=embed)
 
 
 def main():
