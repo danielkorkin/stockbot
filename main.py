@@ -223,6 +223,7 @@ async def get_stock_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
         return None
 
 
+# Update the get_stock_news function
 async def get_stock_news(ticker: str) -> List[Dict]:
     try:
         stock = yf.Ticker(ticker)
@@ -237,7 +238,7 @@ async def get_stock_news(ticker: str) -> List[Dict]:
                 {
                     "title": item.get("title", "No title"),
                     "publisher": item.get("publisher", "Unknown"),
-                    "link": item.get("link", "#"),
+                    "link": item.get("link", ""),  # Change from "#" to empty string
                     "published": datetime.datetime.fromtimestamp(
                         item.get("providerPublishTime", 0)
                     ),
@@ -1328,10 +1329,10 @@ async def stock_chart_command(
     await interaction.followup.send(file=file, embed=embed)
 
 
+# Update the news command's embed_factory
 @stock_group.command(name="news", description="Show latest news for a stock")
 @app_commands.describe(ticker="Ticker symbol")
 async def stock_news_command(interaction: discord.Interaction, ticker: str):
-    # Move existing news command code here
     await interaction.response.defer()
 
     news_items = await get_stock_news(ticker.upper())
@@ -1345,12 +1346,15 @@ async def stock_news_command(interaction: discord.Interaction, ticker: str):
             title=f"{ticker.upper()} News ({page_idx + 1}/{total_pages})",
             description=news_item["title"],
             color=discord.Color.blue(),
-            url=news_item["link"],
         )
+
+        # Only set URL if it's valid
+        if news_item["link"]:
+            embed.url = news_item["link"]
 
         embed.add_field(
             name="Summary",
-            value=f"{news_item['summary'][:1000]}...",  # Truncate long summaries
+            value=f"{news_item['summary'][:1000]}...",
             inline=False,
         )
         embed.add_field(name="Publisher", value=news_item["publisher"], inline=True)
