@@ -923,6 +923,120 @@ async def earnings_report_command(
     )
 
 
+@bot.tree.command(name="buy", description="Buy shares of a stock.")
+@app_commands.describe(
+    ticker="Ticker symbol of the stock", amount="Number of shares to buy"
+)
+async def buy_command(interaction: discord.Interaction, ticker: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message(
+            "You must buy a positive number of shares.", ephemeral=True
+        )
+        return
+
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message(
+            "That stock does not exist.", ephemeral=True
+        )
+        return
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    cost = stock_doc["price"] * amount
+
+    if user_data["balance"] < cost:
+        await interaction.response.send_message(
+            f"Not enough balance to buy {amount} shares of {ticker}. (Cost: ${cost:.2f})",
+            ephemeral=True,
+        )
+        return
+
+    # Update portfolio
+    portfolio = user_data["portfolio"]
+    portfolio[ticker.upper()] = portfolio.get(ticker.upper(), 0) + amount
+    new_balance = user_data["balance"] - cost
+
+    transaction_record = {
+        "type": "buy",
+        "ticker": ticker.upper(),
+        "shares": amount,
+        "price": stock_doc["price"],
+        "timestamp": datetime.datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "portfolio": portfolio},
+            "$push": {"transactions": transaction_record},
+        },
+    )
+
+    await interaction.response.send_message(
+        f"Bought **{amount}** share(s) of **{ticker.upper()}** @ **${stock_doc['price']}** each.\n"
+        f"Total: **${cost:.2f}** | New balance: **${new_balance:.2f}**"
+    )
+
+
+@bot.tree.command(name="sell", description="Sell shares of a stock.")
+@app_commands.describe(
+    ticker="Ticker symbol of the stock", amount="Number of shares to sell"
+)
+async def sell_command(interaction: discord.Interaction, ticker: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message(
+            "You must sell a positive number of shares.", ephemeral=True
+        )
+        return
+
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message(
+            "That stock does not exist.", ephemeral=True
+        )
+        return
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    portfolio = user_data["portfolio"]
+    owned_shares = portfolio.get(ticker.upper(), 0)
+
+    if amount > owned_shares:
+        await interaction.response.send_message(
+            f"You only own {owned_shares} share(s) of {ticker.upper()}.", ephemeral=True
+        )
+        return
+
+    revenue = stock_doc["price"] * amount
+    new_balance = user_data["balance"] + revenue
+    updated_shares = owned_shares - amount
+
+    if updated_shares <= 0:
+        portfolio.pop(ticker.upper())
+    else:
+        portfolio[ticker.upper()] = updated_shares
+
+    transaction_record = {
+        "type": "sell",
+        "ticker": ticker.upper(),
+        "shares": amount,
+        "price": stock_doc["price"],
+        "timestamp": datetime.datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "portfolio": portfolio},
+            "$push": {"transactions": transaction_record},
+        },
+    )
+
+    await interaction.response.send_message(
+        f"Sold **{amount}** share(s) of **{ticker.upper()}** @ **${stock_doc['price']}** each.\n"
+        f"Revenue: **${revenue:.2f}** | New balance: **${new_balance:.2f}**"
+    )
+
+
 def main():
     bot.run(BOT_TOKEN)
 
