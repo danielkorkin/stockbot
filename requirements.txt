@@ -1,7 +1,8 @@
-discord
-matplotlib
-motor
-pandas
-python-dotenv
-yfinance
-pandas-ta
+discord==2.3.2
+matplotlib==3.10.0
+motor==3.6.0
+pandas==2.2.3
+python-dotenv==1.0.1
+yfinance==0.2.51
+numpy==1.23.5
+pandas-ta==0.3.14b
