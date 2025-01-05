@@ -2355,6 +2355,17 @@ crypto_group = app_commands.Group(
 )
 
 
+# Add after the imports section
+def format_crypto_price(price: float) -> str:
+    """Format crypto price with appropriate precision based on price range"""
+    if price < 1:
+        return f"${price:.8f}"  # 8 digits for sub-dollar prices
+    elif price < 10:
+        return f"${price:.4f}"  # 4 digits for under $10
+    else:
+        return f"${price:,.2f}"  # 2 digits for $10+
+
+
 @crypto_group.command(name="buy", description="Buy cryptocurrency")
 @app_commands.describe(
     ticker="Crypto ticker symbol (e.g. BTC, ETH)", amount="Amount to buy (minimum 0.01)"
@@ -2408,7 +2419,7 @@ async def crypto_buy_command(
     )
     embed.add_field(name="Cryptocurrency", value=ticker.upper(), inline=True)
     embed.add_field(name="Amount", value=str(amount), inline=True)
-    embed.add_field(name="Price/Unit", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Price/Unit", value=format_crypto_price(price), inline=True)
     embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
 
@@ -2472,7 +2483,7 @@ async def crypto_sell_command(
     embed = discord.Embed(title="Crypto Sale Successful", color=discord.Color.green())
     embed.add_field(name="Cryptocurrency", value=ticker.upper(), inline=True)
     embed.add_field(name="Amount", value=str(amount), inline=True)
-    embed.add_field(name="Price/Unit", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Price/Unit", value=format_crypto_price(price), inline=True)
     embed.add_field(name="Total Value", value=f"${total_value:,.2f}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
 
@@ -2578,10 +2589,12 @@ async def crypto_chart_command(
     price_change = history["Close"].iloc[-1] - history["Close"].iloc[0]
     price_change_pct = (price_change / history["Close"].iloc[0]) * 100
 
-    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+    embed.add_field(
+        name="Current Price", value=format_crypto_price(current_price), inline=True
+    )
     embed.add_field(
         name="Change",
-        value=f"${price_change:,.2f} ({price_change_pct:,.2f}%)",
+        value=f"{format_crypto_price(price_change)} ({price_change_pct:,.2f}%)",
         inline=True,
     )
     embed.add_field(name="Period", value=period, inline=True)
@@ -2622,7 +2635,7 @@ async def crypto_lookup_command(interaction: discord.Interaction, ticker: str):
 
     embed.add_field(
         name="Current Price",
-        value=f"${info['price']:,.2f}",
+        value=format_crypto_price(info["price"]),
         inline=False,
     )
 
@@ -2691,7 +2704,7 @@ async def history_command(
                 action = "Buy" if tx["type"] == "crypto_buy" else "Sell"
                 embed.add_field(
                     name=f"Crypto {action} {tx['amount']} {tx['ticker']}",
-                    value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                    value=f"Price: {format_crypto_price(tx['price'])}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
                     inline=False,
                 )
             else:  # Stock transactions
