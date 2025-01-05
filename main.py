@@ -9,15 +9,13 @@ from typing import Dict, List, Literal, Optional
 import discord
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-
-# Motor (Async MongoDB driver)
 import motor.motor_asyncio
 import pandas as pd
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
 ###########################
 # Configuration Constants #
@@ -47,12 +45,11 @@ intents.message_content = False  # We primarily use slash commands
 
 def parse_time_period_to_timedelta(time_period: str) -> datetime.timedelta:
     """
-    Convert a time period string like '1m', '1h', '1d', '5d', '10d', '1M'
-    into a proper timedelta. We'll interpret 1M (1 month) as 30 days for simplicity.
+    Convert strings like '1m', '1h', '1d', '5d', '10d', '1M' to timedeltas.
+    For example, '1M' => 30 days. Adjust as needed.
     """
     time_period = time_period.lower().strip()
     if time_period == "1m":
-        # 1 minute
         return datetime.timedelta(minutes=1)
     elif time_period == "1h":
         return datetime.timedelta(hours=1)
@@ -62,10 +59,7 @@ def parse_time_period_to_timedelta(time_period: str) -> datetime.timedelta:
         return datetime.timedelta(days=5)
     elif time_period == "10d":
         return datetime.timedelta(days=10)
-    elif time_period in (
-        "1m",
-        "1mo",
-    ):  # possible conflict with 1 minute, but let's do 1 month
+    elif time_period in ("1m", "1mo"):  # interpret as 1 month
         return datetime.timedelta(days=30)
     else:
         return datetime.timedelta(days=1)
@@ -73,7 +67,8 @@ def parse_time_period_to_timedelta(time_period: str) -> datetime.timedelta:
 
 class PaginatorView(discord.ui.View):
     """
-    Generic Paginator for slash commands using a View with Next/Prev/Stop buttons.
+    Generic paginator for slash commands.
+    Provides Next/Prev/Stop buttons, storing pages in memory.
     """
 
     def __init__(
@@ -92,10 +87,9 @@ class PaginatorView(discord.ui.View):
 
         self.current_page = 0
         total_full_pages = math.ceil(len(items) / items_per_page)
-        if max_pages is not None:
-            self.total_pages = min(total_full_pages, max_pages)
-        else:
-            self.total_pages = total_full_pages
+        self.total_pages = (
+            min(total_full_pages, max_pages) if max_pages else total_full_pages
+        )
 
     async def send_first_page(self, interaction: discord.Interaction):
         embed = self.build_embed()
@@ -161,7 +155,7 @@ class StockSimBot(commands.Bot):
         self.events_collection = None
         self.earnings_collection = None
         self.price_history_collection = None
-        self.alerts_collection = None  # new alerts collection
+        self.alerts_collection = None
 
     async def setup_hook(self):
         try:
@@ -178,15 +172,13 @@ class StockSimBot(commands.Bot):
         # Setup Mongo
         self.motor_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
         self.db = self.motor_client[MONGO_DB_NAME]
-
         self.stock_collection = self.db["stocks"]
         self.user_collection = self.db["users"]
         self.events_collection = self.db["events"]
         self.earnings_collection = self.db["earnings_reports"]
         self.price_history_collection = self.db["stock_price_history"]
-        self.alerts_collection = self.db["alerts"]  # new
+        self.alerts_collection = self.db["alerts"]
 
-        # Start background price update task
         self.update_stock_prices.start()
 
     async def on_ready(self):
@@ -198,29 +190,33 @@ class StockSimBot(commands.Bot):
 
     async def update_prices_algorithm(self, triggered_by_event: bool = False):
         """
-        Extended price update logic:
-          1) Filter out or ignore expired events
-          2) For each stock, skip if plateau == True
-          3) If target_price is set, gradually move stock toward it
-          4) Otherwise do normal random + event-based movement
-          5) Check alerts
+        Extended logic:
+          1) Timed events with 'impact' and 'longevity' [0->minutes, 1->days]
+          2) plateau check
+          3) target_price transitions
+          4) normal random + event-based movement
+          5) check alerts
         """
         now = datetime.datetime.utcnow()
 
-        # 1) Identify valid events (not expired)
+        # 1) Identify valid events (time-based)
         valid_events = []
         async for evt in self.events_collection.find({}):
             timestamp = evt["timestamp"]
             impact = abs(evt.get("impact", 0.0))
-            if impact > 1.0:
-                impact = 1.0
-            hours_duration = 24.0 * impact  # max 24h if impact=1.0
+            longevity = evt.get("longevity", 1.0)  # default 1.0
+            # We'll treat longevity=0 -> 1 hour, longevity=1 -> 24 hours
+            hours_duration = 1.0 + 23.0 * longevity
             expiration = timestamp + datetime.timedelta(hours=hours_duration)
-            if now < expiration:
+            if now < expiration and not evt.get("reset_ignore", False):
                 valid_events.append(evt)
 
         # 2) For each stock
         async for stock in self.stock_collection.find({}):
+            if stock.get("reset_ignore", False):
+                # Means we've used /reset
+                continue
+
             ticker = stock["_id"]
             current_price = stock["price"]
             volatility = stock["volatility"]
@@ -228,18 +224,17 @@ class StockSimBot(commands.Bot):
             plateau = stock.get("plateau", False)
             target_info = stock.get("target_price_info", None)
 
+            # skip changes if plateau
             if plateau:
-                # skip normal price changes
                 continue
 
+            # 3) target price transitions
             if target_info:
-                # 3) Gradually move price
                 t_price = target_info["target_price"]
                 finish_time = target_info["finish_time"]
                 start_time = target_info["start_time"]
                 start_price = target_info["start_price"]
                 if now >= finish_time:
-                    # finalize
                     new_price = t_price
                     await self.stock_collection.update_one(
                         {"_id": ticker},
@@ -254,12 +249,10 @@ class StockSimBot(commands.Bot):
                     ratio = min(elapsed / total_duration, 1.0)
                     new_price = start_price + (t_price - start_price) * ratio
                     new_price = round(new_price, 2)
-
                     await self.stock_collection.update_one(
                         {"_id": ticker}, {"$set": {"price": new_price}}
                     )
 
-                # store price in history
                 price_history_doc = {
                     "ticker": ticker,
                     "price": new_price,
@@ -268,7 +261,7 @@ class StockSimBot(commands.Bot):
                 await self.price_history_collection.insert_one(price_history_doc)
                 continue
 
-            # 4) Normal random + event-based movement
+            # 4) normal random + event-based
             random_factor = random.uniform(-0.01, 0.01) * volatility
             event_factor = 0.0
             for evt in valid_events:
@@ -286,64 +279,52 @@ class StockSimBot(commands.Bot):
                 {"_id": ticker}, {"$set": {"price": new_price}}
             )
 
-            # store price in history
+            # store in history
             price_history_doc = {"ticker": ticker, "price": new_price, "timestamp": now}
             await self.price_history_collection.insert_one(price_history_doc)
 
-        # 5) Check alerts
+        # 5) check alerts
         await self.check_alerts()
 
     async def check_alerts(self):
-        alerts = self.alerts_collection.find({})
-        alerts_map = {}  # ticker -> list of alert docs
-        async for alert in alerts:
+        all_alerts = self.alerts_collection.find({})
+        alerts_map = {}
+        async for alert in all_alerts:
             tk = alert["ticker"]
             if tk not in alerts_map:
                 alerts_map[tk] = []
             alerts_map[tk].append(alert)
 
-        for ticker, alert_list in alerts_map.items():
-            stock_doc = await self.stock_collection.find_one({"_id": ticker})
-            if not stock_doc:
+        for ticker, alist in alerts_map.items():
+            sdoc = await self.stock_collection.find_one({"_id": ticker})
+            if not sdoc:
                 continue
-            current_price = stock_doc["price"]
-
-            for alert in alert_list:
+            curr_price = sdoc["price"]
+            for alert in alist:
                 user_id = alert["user_id"]
                 channel_id = alert["channel_id"]
                 t_price = alert["target_price"]
-                alert_id = alert["_id"]
+                a_id = alert["_id"]
 
                 triggered = False
-                # If current_price >= t_price, or current_price <= t_price (depending on t_price sign)
-                # We'll just check if we've "crossed" it in either direction:
-                # If t_price > current_price, then triggered if current_price >= t_price
-                # If t_price < current_price, then triggered if current_price <= t_price
-                # This is a simple approach; can be refined.
-
-                if current_price >= t_price and t_price >= 0:
+                if curr_price >= t_price and t_price >= 0:
                     triggered = True
-                elif current_price <= t_price and t_price > current_price:
+                elif curr_price <= t_price and t_price > curr_price:
                     triggered = True
-
-                # Alternate check:
-                #   if (current_price >= t_price and current_price - t_price >= 0)
-                #   or (current_price <= t_price and t_price - current_price >= 0)
-                # but let's keep it simple.
 
                 if triggered:
-                    await self.alerts_collection.delete_one({"_id": alert_id})
+                    await self.alerts_collection.delete_one({"_id": a_id})
                     channel = self.get_channel(channel_id)
                     if channel:
-                        user_mention = f"<@{user_id}>"
+                        mention = f"<@{user_id}>"
                         await channel.send(
-                            f"{user_mention}, alert triggered for **{ticker}**!\n"
-                            f"Current Price: `${current_price}` reached target `${t_price}`."
+                            f"{mention}, alert triggered for **{ticker}**!\n"
+                            f"Current Price: `${curr_price}` reached target `${t_price}`."
                         )
 
 
 ######################
-#   Helper Methods   #
+# Helper methods
 ######################
 
 
@@ -362,16 +343,16 @@ async def get_user_data(user_collection, user_id: int):
 
 def calculate_user_net_worth(user_data, stocks_dict):
     total = user_data["balance"]
-    for ticker, shares in user_data["portfolio"].items():
-        if ticker in stocks_dict:
-            total += stocks_dict[ticker]["price"] * shares
+    for tk, sh in user_data["portfolio"].items():
+        if tk in stocks_dict:
+            total += stocks_dict[tk]["price"] * sh
     return round(total, 2)
 
 
 bot = StockSimBot()
 
 #########################
-#       Commands        #
+# Slash Commands
 #########################
 
 
@@ -388,7 +369,7 @@ async def balance_command(interaction: discord.Interaction):
     name="portfolio", description="Show the portfolio of yourself or another user."
 )
 @app_commands.describe(
-    member="Select a user to view their portfolio. Leave blank to view yours."
+    member="Select a user to view their portfolio. Leave blank for yours."
 )
 async def portfolio_command(
     interaction: discord.Interaction, member: Optional[discord.Member] = None
@@ -403,137 +384,116 @@ async def portfolio_command(
         embed.description = "No stocks held."
     else:
         all_stocks = {}
-        async for stock in bot.stock_collection.find({}):
-            all_stocks[stock["_id"]] = stock
-
+        async for sdoc in bot.stock_collection.find({}):
+            all_stocks[sdoc["_id"]] = sdoc
         net_worth = calculate_user_net_worth(user_data, all_stocks)
         lines = []
-        for ticker, shares in user_data["portfolio"].items():
-            stock = all_stocks.get(ticker)
-            if stock:
-                price = stock["price"]
-                value = round(price * shares, 2)
-                lines.append(
-                    f"{ticker}: {shares} share(s) @ ${price:.2f} (Value: ${value})"
-                )
-
+        for tk, sh in user_data["portfolio"].items():
+            st = all_stocks.get(tk)
+            if st:
+                p = st["price"]
+                val = round(p * sh, 2)
+                lines.append(f"{tk}: {sh} share(s) @ ${p:.2f} (Value: ${val})")
         embed.description = "\n".join(lines)
         embed.add_field(name="Net Worth", value=f"${net_worth}", inline=False)
 
     await interaction.response.send_message(embed=embed)
 
 
-################################
-# PAGINATED /LEADERBOARD (max 10 pages, 5 users each)
-################################
+#####################
+# Leaderboard
+#####################
 @bot.tree.command(
-    name="leaderboard", description="Show the top players by net worth (paginated)."
+    name="leaderboard", description="Show top players by net worth (paginated)."
 )
 async def leaderboard_command(interaction: discord.Interaction):
     all_users = bot.user_collection.find({})
     stocks_dict = {}
-    async for stock in bot.stock_collection.find({}):
-        stocks_dict[stock["_id"]] = stock
+    async for sdoc in bot.stock_collection.find({}):
+        stocks_dict[sdoc["_id"]] = sdoc
 
     lb_data = []
-    async for user_data in all_users:
-        uid = user_data["_id"]
-        net_worth = calculate_user_net_worth(user_data, stocks_dict)
-        lb_data.append((uid, net_worth))
-
+    async for ud in all_users:
+        uid = ud["_id"]
+        netw = calculate_user_net_worth(ud, stocks_dict)
+        lb_data.append((uid, netw))
     lb_data.sort(key=lambda x: x[1], reverse=True)
 
-    def embed_factory(
-        page_idx: int, total_pages: int, items_slice: list
-    ) -> discord.Embed:
-        embed = discord.Embed(
-            title=f"Leaderboard - Page {page_idx+1}/{total_pages}",
-            color=discord.Color.gold(),
+    def embed_factory(pg_i: int, total_p: int, items_slice: list) -> discord.Embed:
+        emb = discord.Embed(
+            title=f"Leaderboard - Page {pg_i+1}/{total_p}", color=discord.Color.gold()
         )
         lines = []
-        start_rank = page_idx * 5 + 1
-        for i, (user_id, netw) in enumerate(items_slice, start=start_rank):
-            lines.append(f"**{i}.** <@{user_id}> - ${netw}")
-        embed.description = "\n".join(lines) if lines else "No data"
-        return embed
+        start_rank = pg_i * 5 + 1
+        for i, (u, nw) in enumerate(items_slice, start=start_rank):
+            lines.append(f"**{i}.** <@{u}> - ${nw}")
+        emb.description = "\n".join(lines) if lines else "No data"
+        return emb
 
     if not lb_data:
         await interaction.response.send_message("No data available.")
         return
 
-    view = PaginatorView(
-        items=lb_data,
-        items_per_page=5,
-        embed_factory=embed_factory,
-        author_id=interaction.user.id,
-        max_pages=10,
-    )
+    view = PaginatorView(lb_data, 5, embed_factory, interaction.user.id, max_pages=10)
     await view.send_first_page(interaction)
 
 
-################################
-# PAGINATED /MARKET (1 industry per page)
-################################
+#####################
+# Market
+#####################
 @bot.tree.command(
     name="market", description="Show the market by industry, one page per industry."
 )
 async def market_command(interaction: discord.Interaction):
     cursor = bot.stock_collection.find({})
     industries_map: Dict[str, List[dict]] = {}
-
     async for doc in cursor:
-        industry = doc["industry"]
-        ticker = doc["_id"]
-        price = doc["price"]
-        if industry not in industries_map:
-            industries_map[industry] = []
-        industries_map[industry].append({"ticker": ticker, "price": price})
+        ind = doc["industry"]
+        tk = doc["_id"]
+        pr = doc["price"]
+        if ind not in industries_map:
+            industries_map[ind] = []
+        industries_map[ind].append({"ticker": tk, "price": pr})
 
     pages = []
-    for ind, stocks_list in industries_map.items():
-        stocks_list.sort(key=lambda x: x["ticker"])
-        pages.append((ind, stocks_list))
+    for ind, stlist in industries_map.items():
+        stlist.sort(key=lambda x: x["ticker"])
+        pages.append((ind, stlist))
     pages.sort(key=lambda x: x[0])
 
     if not pages:
         await interaction.response.send_message("No stocks found.")
         return
 
-    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
-        (industry, slist) = subset[0]  # 1 item per page
-        embed = discord.Embed(
-            title=f"Market Overview - Page {page_idx+1}/{total_pages}",
+    def emb_fact(pg_i: int, total_p: int, subset: list) -> discord.Embed:
+        (industry, sl) = subset[0]
+        emb = discord.Embed(
+            title=f"Market Overview - Page {pg_i+1}/{total_p}",
             description=f"Industry: **{industry}**",
             color=discord.Color.blue(),
         )
         lines = []
-        for s in slist:
+        for s in sl:
             lines.append(f"**{s['ticker']}** - ${s['price']:.2f}")
         if lines:
-            embed.add_field(
+            emb.add_field(
                 name="Stocks in this Industry", value="\n".join(lines), inline=False
             )
         else:
-            embed.add_field(
+            emb.add_field(
                 name="Stocks in this Industry", value="No stocks here.", inline=False
             )
-        return embed
+        return emb
 
-    view = PaginatorView(
-        items=pages,
-        items_per_page=1,
-        embed_factory=embed_factory,
-        author_id=interaction.user.id,
-    )
+    view = PaginatorView(pages, 1, emb_fact, interaction.user.id)
     await view.send_first_page(interaction)
 
 
-################################
-# PAGINATED /NEWS (1 news item/page, newest first -> page 1)
-################################
+#####################
+# NEWS
+#####################
 @bot.tree.command(
-    name="news",
-    description="Show all published events (1 item per page, newest first).",
+    name="news", description="Show all published events (1 item/page, newest first)."
 )
 async def news_command(interaction: discord.Interaction):
     cursor = bot.events_collection.find({}).sort("timestamp", -1)
@@ -545,8 +505,8 @@ async def news_command(interaction: discord.Interaction):
         await interaction.response.send_message("No news at the moment.")
         return
 
-    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
-        evt = subset[0]
+    def emb_fact(pg_i: int, tot_pg: int, subs: list) -> discord.Embed:
+        evt = subs[0]
         time_str = evt["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
         impact = evt.get("impact", 0.0)
         t_tickers = evt.get("affected_tickers", [])
@@ -554,105 +514,93 @@ async def news_command(interaction: discord.Interaction):
 
         desc = (
             f"**Date:** {time_str}\n"
-            f"**Impact:** {impact}  (range -1.0 to +1.0)\n"
+            f"**Impact:** {impact} (range -1.0 to +1.0)\n"
             f"**Affected Tickers:** {', '.join(t_tickers) if t_tickers else 'None'}\n"
             f"**Affected Industries:** {', '.join(t_inds) if t_inds else 'None'}\n\n"
             f"{evt['description']}"
         )
-        embed = discord.Embed(
-            title=f"{evt['title']} (Page {page_idx+1}/{total_pages})",
+        emb = discord.Embed(
+            title=f"{evt['title']} (Page {pg_i+1}/{tot_pg})",
             description=desc,
             color=discord.Color.blue(),
         )
-        return embed
+        return emb
 
-    view = PaginatorView(
-        items=events,
-        items_per_page=1,
-        embed_factory=embed_factory,
-        author_id=interaction.user.id,
-    )
+    view = PaginatorView(events, 1, emb_fact, interaction.user.id)
     await view.send_first_page(interaction)
 
 
-################################
-# PAGINATED /HISTORY (10 transactions/page, newest first)
-################################
+######################
+# HISTORY
+######################
 @bot.tree.command(
     name="history",
     description="Show transaction history for yourself or another user (paginated).",
 )
-@app_commands.describe(member="The user to show history for. Leave blank for yourself.")
+@app_commands.describe(member="The user to show (optional).")
 async def history_command(
     interaction: discord.Interaction, member: Optional[discord.Member] = None
 ):
     target = member or interaction.user
     user_data = await get_user_data(bot.user_collection, target.id)
-    transactions = user_data["transactions"]
-    if not transactions:
+    txs = user_data["transactions"]
+    if not txs:
         await interaction.response.send_message(
             f"No transaction history for {target.display_name}."
         )
         return
 
-    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
+    txs.sort(key=lambda x: x["timestamp"], reverse=True)
     hist_data = []
-    for tx in transactions:
+    for tx in txs:
         ts_str = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
         line = f"**{tx['type'].upper()}** {tx['shares']} of {tx['ticker']} @ ${tx['price']:.2f}\nDate: {ts_str}"
         hist_data.append(line)
 
-    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
-        embed = discord.Embed(
-            title=f"{target.display_name}'s Transaction History (Page {page_idx+1}/{total_pages})",
+    def e_fact(pg_i: int, tot_p: int, sub: list) -> discord.Embed:
+        emb = discord.Embed(
+            title=f"{target.display_name}'s Transaction History (Page {pg_i+1}/{tot_p})",
             color=discord.Color.purple(),
         )
-        embed.description = "\n\n".join(subset)
-        return embed
+        emb.description = "\n\n".join(sub)
+        return emb
 
-    view = PaginatorView(
-        items=hist_data,
-        items_per_page=10,
-        embed_factory=embed_factory,
-        author_id=interaction.user.id,
-    )
+    view = PaginatorView(hist_data, 10, e_fact, interaction.user.id)
     await view.send_first_page(interaction)
 
 
+######################
+# STOCK
+######################
 @bot.tree.command(name="stock", description="View a stock's current info.")
-@app_commands.describe(ticker="Ticker symbol of the stock")
+@app_commands.describe(ticker="Ticker symbol")
 async def stock_command(interaction: discord.Interaction, ticker: str):
-    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not stock_doc:
+    sdoc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not sdoc:
         await interaction.response.send_message("Stock not found.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title=f"{stock_doc['name']} ({stock_doc['_id']})", color=discord.Color.green()
+    emb = discord.Embed(
+        title=f"{sdoc['name']} ({sdoc['_id']})", color=discord.Color.green()
     )
-    embed.add_field(name="Price", value=f"${stock_doc['price']:.2f}", inline=True)
-    embed.add_field(name="Industry", value=stock_doc["industry"], inline=True)
-    embed.add_field(name="Volatility", value=str(stock_doc["volatility"]), inline=True)
-    embed.add_field(name="Market Cap", value=str(stock_doc["market_cap"]), inline=True)
-    embed.add_field(
-        name="Dividend Yield", value=str(stock_doc["dividend_yield"]), inline=True
-    )
-    embed.add_field(name="EPS", value=str(stock_doc["eps"]), inline=True)
-    embed.add_field(name="P/E Ratio", value=str(stock_doc["pe_ratio"]), inline=True)
-    embed.add_field(
-        name="Total Shares", value=str(stock_doc["total_shares"]), inline=True
-    )
+    emb.add_field(name="Price", value=f"${sdoc['price']:.2f}", inline=True)
+    emb.add_field(name="Industry", value=sdoc["industry"], inline=True)
+    emb.add_field(name="Volatility", value=str(sdoc["volatility"]), inline=True)
+    emb.add_field(name="Market Cap", value=str(sdoc["market_cap"]), inline=True)
+    emb.add_field(name="Dividend Yield", value=str(sdoc["dividend_yield"]), inline=True)
+    emb.add_field(name="EPS", value=str(sdoc["eps"]), inline=True)
+    emb.add_field(name="P/E Ratio", value=str(sdoc["pe_ratio"]), inline=True)
+    emb.add_field(name="Total Shares", value=str(sdoc["total_shares"]), inline=True)
 
-    # show plateau or target info if set
-    plateau = stock_doc.get("plateau", False)
+    plateau = sdoc.get("plateau", False)
     if plateau:
-        embed.add_field(
+        emb.add_field(
             name="Plateau", value="**ON** (price changes frozen)", inline=False
         )
 
-    tpi = stock_doc.get("target_price_info", None)
+    tpi = sdoc.get("target_price_info", None)
     if tpi:
-        embed.add_field(
+        emb.add_field(
             name="Target Price",
             value=(
                 f"Moving from ${tpi['start_price']:.2f} to "
@@ -662,9 +610,12 @@ async def stock_command(interaction: discord.Interaction, ticker: str):
             inline=False,
         )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=emb)
 
 
+######################
+# STOCK CHART
+######################
 time_period_choices = Literal["1m", "1h", "1d", "5d", "10d", "1M"]
 
 
@@ -672,14 +623,12 @@ time_period_choices = Literal["1m", "1h", "1d", "5d", "10d", "1M"]
     name="stock_chart",
     description="View a stock's price chart for a given time period.",
 )
-@app_commands.describe(
-    ticker="Ticker symbol", time_period="Choose: 1m, 1h, 1d, 5d, 10d, 1M."
-)
+@app_commands.describe(ticker="Ticker symbol", time_period="Choose: 1m,1h,1d,5d,10d,1M")
 async def stock_chart_command(
     interaction: discord.Interaction, ticker: str, time_period: time_period_choices
 ):
-    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not stock_doc:
+    sdoc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not sdoc:
         await interaction.response.send_message("Stock not found.", ephemeral=True)
         return
 
@@ -695,18 +644,16 @@ async def stock_chart_command(
         prices.append(doc["price"])
         times.append(doc["timestamp"])
 
-    embed = discord.Embed(
-        title=f"{stock_doc['name']} ({stock_doc['_id']}) - Last {time_period}",
+    emb = discord.Embed(
+        title=f"{sdoc['name']} ({sdoc['_id']}) - Last {time_period}",
         color=discord.Color.green(),
     )
-    embed.add_field(
-        name="Current Price", value=f"${stock_doc['price']:.2f}", inline=True
-    )
-    embed.add_field(name="Industry", value=stock_doc["industry"], inline=True)
+    emb.add_field(name="Current Price", value=f"${sdoc['price']:.2f}", inline=True)
+    emb.add_field(name="Industry", value=sdoc["industry"], inline=True)
 
     if not prices:
-        embed.description = f"No price history found in the last {time_period}."
-        await interaction.response.send_message(embed=embed)
+        emb.description = f"No price history found in the last {time_period}."
+        await interaction.response.send_message(embed=emb)
         return
 
     fig, ax = plt.subplots()
@@ -725,126 +672,121 @@ async def stock_chart_command(
     plt.close(fig)
 
     file = discord.File(buf, filename=f"{ticker.upper()}-{time_period}-chart.png")
-    embed.set_image(url=f"attachment://{ticker.upper()}-{time_period}-chart.png")
-
-    await interaction.response.send_message(embed=embed, file=file)
-
-
-##################################################
-#   New Commands: alerts, plateau, set_target_price
-#   + existing create_stock, update_stock, publish_event, earnings_report
-##################################################
+    emb.set_image(url=f"attachment://{ticker.upper()}-{time_period}-chart.png")
+    await interaction.response.send_message(embed=emb, file=file)
 
 
-@bot.tree.command(name="alert", description="Set a price alert for a specific stock.")
-@app_commands.describe(
-    ticker="Ticker symbol", target_price="Price at which you want to be alerted"
-)
-async def alert_command(
-    interaction: discord.Interaction, ticker: str, target_price: float
-):
-    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not stock_doc:
-        await interaction.response.send_message("Stock not found.", ephemeral=True)
+######################
+# BUY / SELL
+######################
+@bot.tree.command(name="buy", description="Buy shares of a stock.")
+@app_commands.describe(ticker="Ticker symbol", amount="Number of shares to buy")
+async def buy_command(interaction: discord.Interaction, ticker: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message(
+            "You must buy a positive number of shares.", ephemeral=True
+        )
         return
 
-    alert_doc = {
-        "user_id": interaction.user.id,
-        "channel_id": interaction.channel_id,
+    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not stock_doc:
+        await interaction.response.send_message(
+            "That stock does not exist.", ephemeral=True
+        )
+        return
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    cost = stock_doc["price"] * amount
+    if user_data["balance"] < cost:
+        await interaction.response.send_message(
+            f"Not enough balance to buy {amount} share(s). (Cost: ${cost:.2f})",
+            ephemeral=True,
+        )
+        return
+
+    pf = user_data["portfolio"]
+    pf[ticker.upper()] = pf.get(ticker.upper(), 0) + amount
+    new_balance = user_data["balance"] - cost
+
+    tx_record = {
+        "type": "buy",
         "ticker": ticker.upper(),
-        "target_price": target_price,
+        "shares": amount,
+        "price": stock_doc["price"],
+        "timestamp": datetime.datetime.utcnow(),
     }
-    await bot.alerts_collection.insert_one(alert_doc)
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "portfolio": pf},
+            "$push": {"transactions": tx_record},
+        },
+    )
 
     await interaction.response.send_message(
-        f"Alert set: {ticker.upper()} @ ${target_price:.2f}\n"
-        f"I'll ping you here when this threshold is reached or exceeded."
+        f"Bought **{amount}** share(s) of **{ticker.upper()}** @ ${stock_doc['price']:.2f} each.\n"
+        f"Total: ${cost:.2f} | New balance: ${new_balance:.2f}"
     )
 
 
-@bot.tree.command(
-    name="plateau",
-    description="Toggle plateau (freeze) on/off for a stock (Owner Only).",
-)
-@app_commands.describe(ticker="Which stock to freeze/unfreeze", toggle="on or off")
-async def plateau_command(
-    interaction: discord.Interaction, ticker: str, toggle: Literal["on", "off"]
-):
-    if interaction.user.id != OWNER_ID:
+@bot.tree.command(name="sell", description="Sell shares of a stock.")
+@app_commands.describe(ticker="Ticker symbol", amount="Number of shares to sell")
+async def sell_command(interaction: discord.Interaction, ticker: str, amount: int):
+    if amount <= 0:
         await interaction.response.send_message(
-            "Only the bot owner can use this command.", ephemeral=True
+            "You must sell a positive number of shares.", ephemeral=True
         )
         return
 
     stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
     if not stock_doc:
-        await interaction.response.send_message("Stock not found.", ephemeral=True)
-        return
-
-    new_val = toggle == "on"
-    await bot.stock_collection.update_one(
-        {"_id": ticker.upper()}, {"$set": {"plateau": new_val}}
-    )
-
-    msg = (
-        f"Stock {ticker.upper()} is now plateaued (frozen)."
-        if new_val
-        else f"Stock {ticker.upper()} is no longer plateaued."
-    )
-    await interaction.response.send_message(msg)
-
-
-@bot.tree.command(
-    name="set_target_price",
-    description="Gradually move a stock's price to a target (Owner Only).",
-)
-@app_commands.describe(
-    ticker="Which stock",
-    target_price="Desired final price",
-    duration_minutes="How many minutes until the price is fully at the target",
-)
-async def set_target_price_command(
-    interaction: discord.Interaction,
-    ticker: str,
-    target_price: float,
-    duration_minutes: int,
-):
-    if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
-            "Only the bot owner can use this command.", ephemeral=True
+            "That stock does not exist.", ephemeral=True
         )
         return
 
-    if duration_minutes <= 0:
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    pf = user_data["portfolio"]
+    owned_shares = pf.get(ticker.upper(), 0)
+
+    if amount > owned_shares:
         await interaction.response.send_message(
-            "Duration must be positive.", ephemeral=True
+            f"You only own {owned_shares} share(s).", ephemeral=True
         )
         return
 
-    stock_doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not stock_doc:
-        await interaction.response.send_message("Stock not found.", ephemeral=True)
-        return
+    revenue = stock_doc["price"] * amount
+    new_balance = user_data["balance"] + revenue
+    updated_shares = owned_shares - amount
+    if updated_shares <= 0:
+        pf.pop(ticker.upper(), None)
+    else:
+        pf[ticker.upper()] = updated_shares
 
-    current_price = stock_doc["price"]
-    start_time = datetime.datetime.utcnow()
-    finish_time = start_time + datetime.timedelta(minutes=duration_minutes)
-
-    target_price_info = {
-        "target_price": round(target_price, 2),
-        "start_time": start_time,
-        "finish_time": finish_time,
-        "start_price": current_price,
+    tx_record = {
+        "type": "sell",
+        "ticker": ticker.upper(),
+        "shares": amount,
+        "price": stock_doc["price"],
+        "timestamp": datetime.datetime.utcnow(),
     }
-
-    await bot.stock_collection.update_one(
-        {"_id": ticker.upper()}, {"$set": {"target_price_info": target_price_info}}
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "portfolio": pf},
+            "$push": {"transactions": tx_record},
+        },
     )
 
     await interaction.response.send_message(
-        f"Over the next {duration_minutes} minute(s), {ticker.upper()} will gradually move from "
-        f"${current_price:.2f} to ${target_price:.2f}."
+        f"Sold **{amount}** share(s) of **{ticker.upper()}** @ ${stock_doc['price']:.2f} each.\n"
+        f"Revenue: ${revenue:.2f} | New balance: ${new_balance:.2f}"
     )
+
+
+########################
+# create_stock, update_stock, publish_event, earnings_report
+########################
 
 
 @bot.tree.command(name="create_stock", description="Create a new stock (Owner Only).")
@@ -994,6 +936,7 @@ async def update_stock_command(
     impact="Float from -1.0 to +1.0",
     affected_tickers="Comma-separated ticker(s)",
     affected_industries="Comma-separated industry names",
+    longevity="0=minutes up to 1=days/weeks",
 )
 async def publish_event_command(
     interaction: discord.Interaction,
@@ -1002,35 +945,40 @@ async def publish_event_command(
     impact: float,
     affected_tickers: Optional[str] = "",
     affected_industries: Optional[str] = "",
+    longevity: Optional[float] = 1.0,
 ):
+    """
+    longevity from 0..1: 0 => short duration (1 hour), 1 => long duration (24 hours).
+    """
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
             "Only the bot owner can use this command.", ephemeral=True
         )
         return
 
-    tickers_list = (
-        [t.strip().upper() for t in affected_tickers.split(",") if t.strip()]
+    t_list = (
+        [x.strip().upper() for x in affected_tickers.split(",") if x.strip()]
         if affected_tickers
         else []
     )
-    industries_list = (
-        [i.strip() for i in affected_industries.split(",") if i.strip()]
+    i_list = (
+        [x.strip() for x in affected_industries.split(",") if x.strip()]
         if affected_industries
         else []
     )
 
-    evt_doc = {
+    evdoc = {
         "title": title,
         "description": description,
         "impact": impact,
-        "affected_tickers": tickers_list,
-        "affected_industries": industries_list,
+        "affected_tickers": t_list,
+        "affected_industries": i_list,
+        "longevity": max(0.0, min(longevity, 1.0)),
         "timestamp": datetime.datetime.utcnow(),
+        # "reset_ignore": False, # default
     }
-    await bot.events_collection.insert_one(evt_doc)
+    await bot.events_collection.insert_one(evdoc)
     await bot.update_prices_algorithm(triggered_by_event=True)
-
     await interaction.response.send_message("Event published and prices updated.")
 
 
@@ -1038,8 +986,7 @@ async def publish_event_command(
     name="earnings_report", description="Publish an earnings report (Owner Only)."
 )
 @app_commands.describe(
-    ticker="Which stock's earnings to publish",
-    markdown_text="The text of the earnings report in markdown",
+    ticker="Which stock", markdown_text="The text for the earnings report"
 )
 async def earnings_report_command(
     interaction: discord.Interaction, ticker: str, markdown_text: str
@@ -1050,8 +997,8 @@ async def earnings_report_command(
         )
         return
 
-    sdoc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not sdoc:
+    doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not doc:
         await interaction.response.send_message("Stock not found.", ephemeral=True)
         return
 
@@ -1061,123 +1008,69 @@ async def earnings_report_command(
         "report": markdown_text,
     }
     await bot.earnings_collection.insert_one(entry)
-
     await interaction.response.send_message(
         f"Earnings report for {ticker.upper()} published."
     )
 
 
-##################################################
-#   Buy/Sell Commands
-##################################################
-
-
-@bot.tree.command(name="buy", description="Buy shares of a stock.")
-@app_commands.describe(ticker="Ticker symbol", amount="Number of shares")
-async def buy_command(interaction: discord.Interaction, ticker: str, amount: int):
-    if amount <= 0:
-        await interaction.response.send_message(
-            "You must buy a positive number of shares.", ephemeral=True
-        )
+######################################
+# RESET COMMANDS
+######################################
+@bot.tree.command(
+    name="reset_all",
+    description="Owner only - stops any future impact from events, plateau, targets for ALL tickers.",
+)
+async def reset_all_command(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
         return
 
-    sdoc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not sdoc:
-        await interaction.response.send_message(
-            "That stock does not exist.", ephemeral=True
-        )
-        return
-
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    cost = sdoc["price"] * amount
-    if user_data["balance"] < cost:
-        await interaction.response.send_message(
-            f"Not enough balance to buy {amount} share(s) of {ticker}. (Cost: ${cost:.2f})",
-            ephemeral=True,
-        )
-        return
-
-    portfolio = user_data["portfolio"]
-    portfolio[ticker.upper()] = portfolio.get(ticker.upper(), 0) + amount
-    new_balance = user_data["balance"] - cost
-
-    tx_record = {
-        "type": "buy",
-        "ticker": ticker.upper(),
-        "shares": amount,
-        "price": sdoc["price"],
-        "timestamp": datetime.datetime.utcnow(),
-    }
-    await bot.user_collection.update_one(
-        {"_id": interaction.user.id},
+    # Mark all events to ignore
+    await bot.events_collection.update_many({}, {"$set": {"reset_ignore": True}})
+    # For all stocks, remove plateau and target info, set reset_ignore
+    await bot.stock_collection.update_many(
+        {},
         {
-            "$set": {"balance": new_balance, "portfolio": portfolio},
-            "$push": {"transactions": tx_record},
+            "$unset": {"plateau": "", "target_price_info": ""},
+            "$set": {"reset_ignore": True},
         },
     )
 
     await interaction.response.send_message(
-        f"Bought **{amount}** share(s) of **{ticker.upper()}** @ ${sdoc['price']:.2f} each.\n"
-        f"Total: ${cost:.2f} | New balance: ${new_balance:.2f}"
+        "All tickers reset: ignoring current events, plateau, and target prices. Future events remain unaffected."
     )
 
 
-@bot.tree.command(name="sell", description="Sell shares of a stock.")
-@app_commands.describe(ticker="Ticker symbol", amount="Number of shares to sell")
-async def sell_command(interaction: discord.Interaction, ticker: str, amount: int):
-    if amount <= 0:
-        await interaction.response.send_message(
-            "You must sell a positive number of shares.", ephemeral=True
-        )
+@bot.tree.command(
+    name="reset", description="Owner only - stops future impact for a single ticker."
+)
+@app_commands.describe(ticker="Which ticker to reset")
+async def reset_single_ticker_command(interaction: discord.Interaction, ticker: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
         return
 
-    sdoc = await bot.stock_collection.find_one({"_id": ticker.upper()})
-    if not sdoc:
-        await interaction.response.send_message(
-            "That stock does not exist.", ephemeral=True
-        )
+    doc = await bot.stock_collection.find_one({"_id": ticker.upper()})
+    if not doc:
+        await interaction.response.send_message("Stock not found.", ephemeral=True)
         return
 
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    portfolio = user_data["portfolio"]
-    owned_shares = portfolio.get(ticker.upper(), 0)
-
-    if amount > owned_shares:
-        await interaction.response.send_message(
-            f"You only own {owned_shares} share(s) of {ticker.upper()}.", ephemeral=True
-        )
-        return
-
-    revenue = sdoc["price"] * amount
-    new_balance = user_data["balance"] + revenue
-    updated_shares = owned_shares - amount
-
-    if updated_shares <= 0:
-        portfolio.pop(ticker.upper(), None)
-    else:
-        portfolio[ticker.upper()] = updated_shares
-
-    tx_record = {
-        "type": "sell",
-        "ticker": ticker.upper(),
-        "shares": amount,
-        "price": sdoc["price"],
-        "timestamp": datetime.datetime.utcnow(),
-    }
-    await bot.user_collection.update_one(
-        {"_id": interaction.user.id},
+    # Unset plateau/target, set reset_ignore
+    await bot.stock_collection.update_one(
+        {"_id": ticker.upper()},
         {
-            "$set": {"balance": new_balance, "portfolio": portfolio},
-            "$push": {"transactions": tx_record},
+            "$unset": {"plateau": "", "target_price_info": ""},
+            "$set": {"reset_ignore": True},
         },
     )
-
     await interaction.response.send_message(
-        f"Sold **{amount}** share(s) of **{ticker.upper()}** @ ${sdoc['price']:.2f} each.\n"
-        f"Revenue: ${revenue:.2f} | New balance: ${new_balance:.2f}"
+        f"{ticker.upper()} reset. Future changes from existing events won't apply to it anymore."
     )
 
 
+######################
+# BOT run
+######################
 def main():
     bot.run(BOT_TOKEN)
 
