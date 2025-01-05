@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import datetime
+import datetime as dt
 import io
 import math
 import os
@@ -15,6 +16,7 @@ import matplotlib.pyplot as plt
 import motor.motor_asyncio
 import pandas as pd
 import pandas_ta as ta  # Add to requirements.txt
+import pytz
 import yfinance as yf
 
 # Add these imports at the top
@@ -1057,6 +1059,250 @@ async def stock_lookup_command(interaction: discord.Interaction, ticker: str):
     await interaction.response.send_message(embed=embed)
 
 
+@stock_group.command(name="history", description="Show trading history")
+@app_commands.describe(user="Optional: View another user's history")
+async def stock_history_command(
+    interaction: discord.Interaction, user: discord.Member = None
+):
+    """View trading history with pagination (5 trades per page)"""
+    target_user = user or interaction.user
+    user_data = await get_user_data(bot.user_collection, target_user.id)
+    transactions = user_data["transactions"]
+
+    if not transactions:
+        await interaction.response.send_message(
+            f"{'You have' if user is None else f'{target_user.display_name} has'} no transaction history.",
+            ephemeral=True,
+        )
+        return
+
+    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Transaction History - {target_user.display_name}",
+            color=discord.Color.purple(),
+        )
+
+        for tx in subset:
+            timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            embed.add_field(
+                name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
+                value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                inline=False,
+            )
+
+        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}")
+        return embed
+
+    view = PaginatorView(transactions, 5, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction)
+
+
+@stock_group.command(name="portfolio", description="Show portfolio holdings")
+@app_commands.describe(user="Optional: View another user's portfolio")
+async def stock_portfolio_command(
+    interaction: discord.Interaction, user: discord.Member = None
+):
+    """View portfolio with pagination (5 stocks per page)"""
+    target_user = user or interaction.user
+    user_data = await get_user_data(bot.user_collection, target_user.id)
+    portfolio = user_data["portfolio"]
+
+    if not portfolio:
+        message = (
+            "Your portfolio is empty."
+            if user is None
+            else f"{target_user.display_name}'s portfolio is empty."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    # Convert portfolio to list of (ticker, shares) for pagination
+    portfolio_items = list(portfolio.items())
+    portfolio_value, price_info = await calculate_portfolio_value(portfolio)
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Portfolio - {target_user.display_name}", color=discord.Color.blue()
+        )
+
+        page_total = 0.0
+        for ticker, shares in subset:
+            if ticker in price_info:
+                info = price_info[ticker]
+                value = info["total_value"]
+                page_total += value
+
+                embed.add_field(
+                    name=ticker,
+                    value=f"{shares} shares @ ${info['price']:,.2f} each ({info['market_status']})\n"
+                    f"Value: ${value:,.2f}",
+                    inline=False,
+                )
+
+        embed.add_field(
+            name="Portfolio Value",
+            value=f"Page Total: ${page_total:,.2f}\nTotal Value: ${portfolio_value:,.2f}",
+            inline=False,
+        )
+
+        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}")
+        return embed
+
+    view = PaginatorView(portfolio_items, 5, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction)
+
+
+async def get_market_hours() -> Dict:
+    """Get market hours and status for today"""
+    et_tz = pytz.timezone("US/Eastern")
+    now = dt.datetime.now(et_tz)
+
+    # Market schedule (ET)
+    pre_market_start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    after_market_end = now.replace(hour=20, minute=0, second=0, microsecond=0)
+
+    # Check if it's a weekday
+    is_weekday = now.weekday() < 5
+
+    # Determine current market phase
+    if not is_weekday:
+        status = "Closed (Weekend)"
+    elif now < pre_market_start:
+        status = "Closed (Pre-market starts at 4:00 AM ET)"
+    elif pre_market_start <= now < market_open:
+        status = "Pre-market Trading"
+    elif market_open <= now < market_close:
+        status = "Regular Trading Hours"
+    elif market_close <= now < after_market_end:
+        status = "After-hours Trading"
+    else:
+        status = "Closed"
+
+    return {
+        "status": status,
+        "pre_market": "4:00 AM - 9:30 AM ET",
+        "regular": "9:30 AM - 4:00 PM ET",
+        "after_hours": "4:00 PM - 8:00 PM ET",
+        "is_open": market_open <= now < market_close and is_weekday,
+    }
+
+
+async def get_major_indices() -> Dict:
+    """Get major market indices performance"""
+    try:
+        indices = {"^GSPC": "S&P 500", "^DJI": "Dow Jones", "^IXIC": "NASDAQ"}
+
+        results = {}
+        for symbol, name in indices.items():
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            price = info.get("regularMarketPrice", 0)
+            prev_close = info.get("previousClose", 0)
+            if price and prev_close:
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100
+                results[name] = {
+                    "price": price,
+                    "change": change,
+                    "change_pct": change_pct,
+                }
+        return results
+    except Exception as e:
+        print(f"Error fetching indices: {e}")
+        return {}
+
+
+async def get_top_movers(limit: int = 5) -> Dict[str, List]:
+    """Get top gainers and losers for the day"""
+    try:
+        stocks = await get_top_stocks()
+        if not stocks:
+            return {"gainers": [], "losers": []}
+
+        # Get current prices and calculate daily changes
+        movers = []
+        for stock in stocks:
+            ticker = stock["ticker"]
+            info = await get_stock_info(ticker)
+            if info:
+                price = info["price"]
+                prev_close = info.get("previous_close", price)
+                if prev_close:
+                    change_pct = ((price - prev_close) / prev_close) * 100
+                    movers.append(
+                        {
+                            "ticker": ticker,
+                            "name": info["name"],
+                            "price": price,
+                            "change_pct": change_pct,
+                        }
+                    )
+
+        # Sort and get top gainers/losers
+        movers.sort(key=lambda x: x["change_pct"], reverse=True)
+        return {"gainers": movers[:limit], "losers": movers[-limit:][::-1]}
+    except Exception as e:
+        print(f"Error getting top movers: {e}")
+        return {"gainers": [], "losers": []}
+
+
+@stock_group.command(name="today", description="Get today's market overview")
+async def stock_today_command(interaction: discord.Interaction):
+    """Show today's market status and trends"""
+    await interaction.response.defer()
+
+    # Get all data concurrently
+    market_hours = await get_market_hours()
+    indices = await get_major_indices()
+    movers = await get_top_movers(5)
+
+    # Create embed
+    embed = discord.Embed(
+        title="Market Overview",
+        description=f"Market Status: {market_hours['status']}",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+
+    # Add trading hours field
+    embed.add_field(
+        name="Trading Hours (ET)",
+        value=f"Pre-market: {market_hours['pre_market']}\n"
+        f"Regular: {market_hours['regular']}\n"
+        f"After-hours: {market_hours['after_hours']}",
+        inline=False,
+    )
+
+    # Add major indices
+    for name, data in indices.items():
+        color = "🟢" if data["change"] >= 0 else "🔴"
+        embed.add_field(
+            name=name,
+            value=f"{color} ${data['price']:,.2f}\n"
+            f"{data['change_pct']:+.2f}% "
+            f"(${data['change']:+,.2f})",
+            inline=True,
+        )
+
+    # Add top gainers
+    gainers_text = ""
+    for stock in movers["gainers"]:
+        gainers_text += f"**{stock['ticker']}**: +{stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
+    embed.add_field(name="Top Gainers", value=gainers_text or "No data", inline=False)
+
+    # Add top losers
+    losers_text = ""
+    for stock in movers["losers"]:
+        losers_text += f"**{stock['ticker']}**: {stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
+    embed.add_field(name="Top Losers", value=losers_text or "No data", inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
 bot = StockBot()
 
 
@@ -1080,67 +1326,6 @@ async def balance_command(interaction: discord.Interaction):
     embed.set_footer(
         text=f"Values updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="portfolio", description="Show your portfolio.")
-async def portfolio_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    portfolio = user_data["portfolio"]
-
-    if not portfolio:
-        await interaction.response.send_message(
-            "Your portfolio is empty.", ephemeral=True
-        )
-        return
-
-    embed = discord.Embed(title="Your Portfolio", color=discord.Color.blue())
-    total_value = 0.0
-
-    # Get detailed portfolio value with price info
-    portfolio_value, price_info = await calculate_portfolio_value(portfolio)
-
-    for ticker, shares in portfolio.items():
-        if ticker in price_info:
-            info = price_info[ticker]
-            value = info["total_value"]
-            total_value += value
-
-            # Add market status to each holding
-            embed.add_field(
-                name=ticker,
-                value=f"{shares} shares @ ${info['price']:,.2f} each ({info['market_status']})\n"
-                f"Value: ${value:,.2f}",
-                inline=False,
-            )
-
-    embed.add_field(
-        name="Total Portfolio Value", value=f"${total_value:,.2f}", inline=False
-    )
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="history", description="Show your transaction history.")
-async def history_command(interaction: discord.Interaction):
-    user_data = await get_user_data(bot.user_collection, interaction.user.id)
-    transactions = user_data["transactions"]
-
-    if not transactions:
-        await interaction.response.send_message(
-            "You have no transaction history.", ephemeral=True
-        )
-        return
-
-    transactions.sort(key=lambda x: x["timestamp"], reverse=True)
-    embed = discord.Embed(title="Transaction History", color=discord.Color.purple())
-    for tx in transactions:
-        timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
-        embed.add_field(
-            name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
-            value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
-            inline=False,
-        )
 
     await interaction.response.send_message(embed=embed)
 
