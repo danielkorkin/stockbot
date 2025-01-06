@@ -599,6 +599,10 @@ class AlertManager:
                             await self.execute_buy_order(order, price)
                         elif order["type"] == "sell" and price >= order["price"]:
                             await self.execute_sell_order(order, price)
+                        elif order["type"] == "short" and price >= order["price"]:
+                            await self.execute_short_order(order, price)
+                        elif order["type"] == "cover" and price <= order["price"]:
+                            await self.execute_cover_order(order, price)
 
             except Exception as e:
                 print(f"Error checking alerts/orders: {e}")
@@ -716,6 +720,154 @@ class AlertManager:
 
         except Exception as e:
             print(f"Error executing sell order: {e}")
+
+    async def execute_short_order(self, order: Dict, current_price: float):
+        """Execute a pending short order"""
+        if not self.bot:
+            return
+
+        try:
+            user_data = await get_user_data(self.bot.user_collection, order["user_id"])
+
+            if user_data["balance"] >= order["margin_required"]:
+                # Execute the short
+                new_balance = user_data["balance"] - order["margin_required"]
+                short_positions = user_data.get("short_positions", {})
+                short_positions[order["ticker"]] = (
+                    short_positions.get(order["ticker"], 0) + order["shares"]
+                )
+
+                transaction = {
+                    "type": "short",
+                    "ticker": order["ticker"],
+                    "shares": order["shares"],
+                    "price": current_price,
+                    "total": current_price * order["shares"],
+                    "margin": order["margin_required"],
+                    "timestamp": datetime.utcnow(),
+                }
+
+                await self.bot.user_collection.update_one(
+                    {"_id": order["user_id"]},
+                    {
+                        "$set": {
+                            "balance": new_balance,
+                            "short_positions": short_positions,
+                        },
+                        "$push": {"transactions": transaction},
+                    },
+                )
+
+                # Remove the pending order
+                await self.bot.db[PENDING_ORDERS_COLLECTION].delete_one(
+                    {"_id": order["_id"]}
+                )
+
+                # Notify the user
+                user = await self.bot.fetch_user(order["user_id"])
+                if user:
+                    embed = discord.Embed(
+                        title="Short Order Executed",
+                        description=f"Shorted {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
+                        color=discord.Color.red(),
+                    )
+                    embed.add_field(
+                        name="Margin Used", value=f"${order['margin_required']:,.2f}"
+                    )
+                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                    await user.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error executing short order: {e}")
+
+    async def execute_cover_order(self, order: Dict, current_price: float):
+        """Execute a pending cover order"""
+        if not self.bot:
+            return
+
+        try:
+            user_data = await get_user_data(self.bot.user_collection, order["user_id"])
+            short_positions = user_data.get("short_positions", {})
+
+            if (
+                order["ticker"] in short_positions
+                and short_positions[order["ticker"]] >= order["shares"]
+            ):
+                # Find original short transaction for this position
+                original_short = next(
+                    (
+                        t
+                        for t in reversed(user_data["transactions"])
+                        if t["type"] == "short" and t["ticker"] == order["ticker"]
+                    ),
+                    None,
+                )
+
+                if not original_short:
+                    print(
+                        f"Error: Cannot find original short position for {order['ticker']}"
+                    )
+                    return
+
+                # Calculate profit/loss and margin return
+                entry_price = original_short["price"]
+                margin_return = (
+                    order["shares"] / original_short["shares"]
+                ) * original_short["margin"]
+                profit_loss = (entry_price - current_price) * order["shares"]
+
+                # Update user's balance and positions
+                new_balance = user_data["balance"] + margin_return + profit_loss
+                short_positions[order["ticker"]] -= order["shares"]
+                if short_positions[order["ticker"]] == 0:
+                    del short_positions[order["ticker"]]
+
+                transaction = {
+                    "type": "cover",
+                    "ticker": order["ticker"],
+                    "shares": order["shares"],
+                    "price": current_price,
+                    "entry_price": entry_price,
+                    "profit_loss": profit_loss,
+                    "margin_returned": margin_return,
+                    "timestamp": datetime.utcnow(),
+                }
+
+                await self.bot.user_collection.update_one(
+                    {"_id": order["user_id"]},
+                    {
+                        "$set": {
+                            "balance": new_balance,
+                            "short_positions": short_positions,
+                        },
+                        "$push": {"transactions": transaction},
+                    },
+                )
+
+                # Remove the pending order
+                await self.bot.db[PENDING_ORDERS_COLLECTION].delete_one(
+                    {"_id": order["_id"]}
+                )
+
+                # Notify the user
+                user = await self.bot.fetch_user(order["user_id"])
+                if user:
+                    embed = discord.Embed(
+                        title="Cover Order Executed",
+                        description=f"Covered {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
+                        color=discord.Color.green()
+                        if profit_loss >= 0
+                        else discord.Color.red(),
+                    )
+                    embed.add_field(name="Profit/Loss", value=f"${profit_loss:,.2f}")
+                    embed.add_field(
+                        name="Margin Returned", value=f"${margin_return:,.2f}"
+                    )
+                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                    await user.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error executing cover order: {e}")
 
 
 async def get_stock_price(ticker: str) -> Optional[float]:
@@ -1776,23 +1928,35 @@ async def pending_orders_command(interaction: discord.Interaction):
         order = subset[0]  # Show one order per page
         order_type = order["type"].capitalize()
         ticker = order["ticker"]
+
         embed = discord.Embed(
             title=f"Pending Orders ({page_idx + 1}/{total_pages})",
             color=discord.Color.blue(),
         )
 
-        total = order["price"] * order["quantity"]
+        total = order["price"] * order.get("shares", 0)
         embed.add_field(name="Type", value=order_type, inline=True)
         embed.add_field(name="Stock", value=ticker, inline=True)
-        embed.add_field(name="Quantity", value=str(order["quantity"]), inline=True)
+        embed.add_field(name="Quantity", value=str(order.get("shares", 0)), inline=True)
         embed.add_field(
             name="Target Price", value=f"${order['price']:,.2f}", inline=True
         )
-        embed.add_field(
-            name=f"Total {'Cost' if order_type == 'Buy' else 'Value'}",
-            value=f"${total:,.2f}",
-            inline=True,
-        )
+
+        if order_type in ["Short"]:
+            embed.add_field(
+                name="Margin Required",
+                value=f"${order.get('margin_required', 0):,.2f}",
+                inline=True,
+            )
+
+        value_label = {
+            "Buy": "Total Cost",
+            "Sell": "Total Value",
+            "Short": "Position Value",
+            "Cover": "Total Value",
+        }.get(order_type, "Value")
+
+        embed.add_field(name=value_label, value=f"${total:,.2f}", inline=True)
         embed.add_field(
             name="Created",
             value=order["created_at"].strftime("%Y-%m-%d %H:%M UTC"),
@@ -2159,6 +2323,136 @@ async def stock_cover_command(
     embed.add_field(name="Profit/Loss", value=f"${profit_loss:,.2f}", inline=True)
     embed.add_field(name="Margin Returned", value=f"${margin_return:,.2f}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(
+    name="shortat", description="Set up an automatic short position at a specific price"
+)
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    shares="Number of shares to short",
+    price="Target price to short at",
+)
+async def shortat_command(
+    interaction: discord.Interaction, ticker: str, shares: int, price: float
+):
+    """Create a pending short order"""
+    if shares <= 0 or price <= 0:
+        await interaction.response.send_message(
+            "Please enter positive values.", ephemeral=True
+        )
+        return
+
+    # Verify the ticker exists
+    current_price = await get_stock_price(ticker.upper())
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Calculate margin requirement (50% of total position value)
+    total_value = price * shares
+    margin_required = total_value * 0.5
+
+    # Verify user has sufficient funds for margin
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    if user_data["balance"] < margin_required:
+        await interaction.response.send_message(
+            f"Insufficient funds for margin. Shorting {shares} shares requires ${margin_required:,.2f} in margin.",
+            ephemeral=True,
+        )
+        return
+
+    # Add the pending order
+    order = {
+        "user_id": interaction.user.id,
+        "type": "short",
+        "ticker": ticker.upper(),
+        "shares": shares,
+        "price": price,
+        "margin_required": margin_required,
+        "created_at": datetime.utcnow(),
+    }
+
+    await bot.db[PENDING_ORDERS_COLLECTION].insert_one(order)
+
+    embed = discord.Embed(
+        title="Short Order Created",
+        description=f"Will short {ticker.upper()} when price reaches ${price:,.2f}",
+        color=discord.Color.red(),
+    )
+    embed.add_field(name="Shares", value=str(shares), inline=True)
+    embed.add_field(name="Position Value", value=f"${total_value:,.2f}", inline=True)
+    embed.add_field(
+        name="Margin Required", value=f"${margin_required:,.2f}", inline=True
+    )
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(
+    name="coverat", description="Set up an automatic cover order at a specific price"
+)
+@app_commands.describe(
+    ticker="Stock ticker symbol",
+    shares="Number of shares to cover",
+    price="Target price to cover at",
+)
+async def coverat_command(
+    interaction: discord.Interaction, ticker: str, shares: int, price: float
+):
+    """Create a pending cover order"""
+    if shares <= 0 or price <= 0:
+        await interaction.response.send_message(
+            "Please enter positive values.", ephemeral=True
+        )
+        return
+
+    # Verify the ticker exists and user has sufficient short position
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    short_positions = user_data.get("short_positions", {})
+
+    if (
+        ticker.upper() not in short_positions
+        or short_positions[ticker.upper()] < shares
+    ):
+        await interaction.response.send_message(
+            "You don't have enough shares shorted to cover.", ephemeral=True
+        )
+        return
+
+    current_price = await get_stock_price(ticker.upper())
+    if current_price is None:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Add the pending order
+    order = {
+        "user_id": interaction.user.id,
+        "type": "cover",
+        "ticker": ticker.upper(),
+        "shares": shares,
+        "price": price,
+        "created_at": datetime.utcnow(),
+    }
+
+    await bot.db[PENDING_ORDERS_COLLECTION].insert_one(order)
+
+    total_value = price * shares
+    embed = discord.Embed(
+        title="Cover Order Created",
+        description=f"Will cover {ticker.upper()} when price reaches ${price:,.2f}",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Shares", value=str(shares), inline=True)
+    embed.add_field(name="Total Value", value=f"${total_value:,.2f}", inline=True)
+    embed.add_field(name="Current Price", value=f"${current_price:,.2f}", inline=True)
 
     await interaction.response.send_message(embed=embed)
 
