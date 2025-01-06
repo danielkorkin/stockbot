@@ -2707,18 +2707,34 @@ async def history_command(
 
         for tx in subset:
             timestamp = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            tx_type = tx["type"]
 
-            if tx["type"] in ["crypto_buy", "crypto_sell"]:
-                action = "Buy" if tx["type"] == "crypto_buy" else "Sell"
+            if tx_type == "bankruptcy":
+                # Handle bankruptcy transactions
                 embed.add_field(
-                    name=f"Crypto {action} {tx['amount']} {tx['ticker']}",
-                    value=f"Price: {format_crypto_price(tx['price'])}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                    name="Bankruptcy Declared",
+                    value=f"Assets Liquidated: ${tx['value_liquidated']:,.2f}\n"
+                    f"New Balance: ${tx['new_balance']:,.2f}\n"
+                    f"Date: {timestamp}",
                     inline=False,
                 )
-            else:  # Stock transactions
+            elif tx_type in ["crypto_buy", "crypto_sell"]:
+                # Handle crypto transactions
+                action = "Buy" if tx_type == "crypto_buy" else "Sell"
                 embed.add_field(
-                    name=f"{tx['type'].capitalize()} {tx['shares']} {tx['ticker']}",
-                    value=f"Price: ${tx['price']:,.2f}\nTotal: ${tx['total']:,.2f}\nDate: {timestamp}",
+                    name=f"Crypto {action} {tx['amount']} {tx['ticker']}",
+                    value=f"Price: {format_crypto_price(tx['price'])}\n"
+                    f"Total: ${tx['total']:,.2f}\n"
+                    f"Date: {timestamp}",
+                    inline=False,
+                )
+            else:
+                # Handle stock transactions
+                embed.add_field(
+                    name=f"{tx_type.capitalize()} {tx.get('shares', 0)} {tx['ticker']}",
+                    value=f"Price: ${tx['price']:,.2f}\n"
+                    f"Total: ${tx['total']:,.2f}\n"
+                    f"Date: {timestamp}",
                     inline=False,
                 )
 
