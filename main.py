@@ -611,12 +611,23 @@ class AlertManager:
 
     async def execute_buy_order(self, order: Dict, current_price: float):
         """Execute a pending buy order"""
-        if not self.bot:  # Add safety check
+        if not self.bot:
             return
 
         try:
             user_data = await get_user_data(self.bot.user_collection, order["user_id"])
             total_cost = current_price * order["quantity"]
+
+            # Get the original channel from the order data
+            channel_id = order.get("channel_id")
+            if not channel_id:
+                print(f"No channel ID found for order {order['_id']}")
+                return
+
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                print(f"Could not find channel {channel_id}")
+                return
 
             if user_data["balance"] >= total_cost:
                 # Execute the buy
@@ -648,27 +659,36 @@ class AlertManager:
                     {"_id": order["_id"]}
                 )
 
-                # Notify the user
-                user = await self.bot.fetch_user(order["user_id"])
-                if user:
-                    embed = discord.Embed(
-                        title="Buy Order Executed",
-                        description=f"Bought {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
-                        color=discord.Color.green(),
-                    )
-                    embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}")
-                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
-                    await user.send(embed=embed)
+                # Notify in channel instead of DM
+                embed = discord.Embed(
+                    title="Buy Order Executed",
+                    description=f"<@{order['user_id']}>, bought {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
+                    color=discord.Color.green(),
+                )
+                embed.add_field(name="Total Cost", value=f"${total_cost:,.2f}")
+                embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                await channel.send(embed=embed)
 
         except Exception as e:
             print(f"Error executing buy order: {e}")
 
     async def execute_sell_order(self, order: Dict, current_price: float):
         """Execute a pending sell order"""
-        if not self.bot:  # Add safety check
+        if not self.bot:
             return
 
         try:
+            # Get the channel first
+            channel_id = order.get("channel_id")
+            if not channel_id:
+                print(f"No channel ID found for order {order['_id']}")
+                return
+
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                print(f"Could not find channel {channel_id}")
+                return
+
             user_data = await get_user_data(self.bot.user_collection, order["user_id"])
             portfolio = user_data["portfolio"]
 
@@ -706,17 +726,15 @@ class AlertManager:
                     {"_id": order["_id"]}
                 )
 
-                # Notify the user
-                user = await self.bot.fetch_user(order["user_id"])
-                if user:
-                    embed = discord.Embed(
-                        title="Sell Order Executed",
-                        description=f"Sold {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
-                        color=discord.Color.green(),
-                    )
-                    embed.add_field(name="Total Value", value=f"${total_value:,.2f}")
-                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
-                    await user.send(embed=embed)
+                # Notify in channel instead of DM
+                embed = discord.Embed(
+                    title="Sell Order Executed",
+                    description=f"<@{order['user_id']}>, sold {order['quantity']} shares of {order['ticker']} at ${current_price:,.2f}",
+                    color=discord.Color.green(),
+                )
+                embed.add_field(name="Total Value", value=f"${total_value:,.2f}")
+                embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                await channel.send(embed=embed)
 
         except Exception as e:
             print(f"Error executing sell order: {e}")
@@ -727,6 +745,17 @@ class AlertManager:
             return
 
         try:
+            # Get the channel first
+            channel_id = order.get("channel_id")
+            if not channel_id:
+                print(f"No channel ID found for order {order['_id']}")
+                return
+
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                print(f"Could not find channel {channel_id}")
+                return
+
             user_data = await get_user_data(self.bot.user_collection, order["user_id"])
 
             if user_data["balance"] >= order["margin_required"]:
@@ -763,19 +792,17 @@ class AlertManager:
                     {"_id": order["_id"]}
                 )
 
-                # Notify the user
-                user = await self.bot.fetch_user(order["user_id"])
-                if user:
-                    embed = discord.Embed(
-                        title="Short Order Executed",
-                        description=f"Shorted {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
-                        color=discord.Color.red(),
-                    )
-                    embed.add_field(
-                        name="Margin Used", value=f"${order['margin_required']:,.2f}"
-                    )
-                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
-                    await user.send(embed=embed)
+                # Notify in channel instead of DM
+                embed = discord.Embed(
+                    title="Short Order Executed",
+                    description=f"<@{order['user_id']}>, shorted {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
+                    color=discord.Color.red(),
+                )
+                embed.add_field(
+                    name="Margin Used", value=f"${order['margin_required']:,.2f}"
+                )
+                embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                await channel.send(embed=embed)
 
         except Exception as e:
             print(f"Error executing short order: {e}")
@@ -786,6 +813,17 @@ class AlertManager:
             return
 
         try:
+            # Get the channel first
+            channel_id = order.get("channel_id")
+            if not channel_id:
+                print(f"No channel ID found for order {order['_id']}")
+                return
+
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                print(f"Could not find channel {channel_id}")
+                return
+
             user_data = await get_user_data(self.bot.user_collection, order["user_id"])
             short_positions = user_data.get("short_positions", {})
 
@@ -849,22 +887,18 @@ class AlertManager:
                     {"_id": order["_id"]}
                 )
 
-                # Notify the user
-                user = await self.bot.fetch_user(order["user_id"])
-                if user:
-                    embed = discord.Embed(
-                        title="Cover Order Executed",
-                        description=f"Covered {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
-                        color=discord.Color.green()
-                        if profit_loss >= 0
-                        else discord.Color.red(),
-                    )
-                    embed.add_field(name="Profit/Loss", value=f"${profit_loss:,.2f}")
-                    embed.add_field(
-                        name="Margin Returned", value=f"${margin_return:,.2f}"
-                    )
-                    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
-                    await user.send(embed=embed)
+                # Notify in channel instead of DM
+                embed = discord.Embed(
+                    title="Cover Order Executed",
+                    description=f"<@{order['user_id']}>, covered {order['shares']} shares of {order['ticker']} at ${current_price:,.2f}",
+                    color=discord.Color.green()
+                    if profit_loss >= 0
+                    else discord.Color.red(),
+                )
+                embed.add_field(name="Profit/Loss", value=f"${profit_loss:,.2f}")
+                embed.add_field(name="Margin Returned", value=f"${margin_return:,.2f}")
+                embed.add_field(name="New Balance", value=f"${new_balance:,.2f}")
+                await channel.send(embed=embed)
 
         except Exception as e:
             print(f"Error executing cover order: {e}")
@@ -2369,6 +2403,7 @@ async def shortat_command(
     # Add the pending order
     order = {
         "user_id": interaction.user.id,
+        "channel_id": interaction.channel_id,  # Add this line
         "type": "short",
         "ticker": ticker.upper(),
         "shares": shares,
@@ -2435,6 +2470,7 @@ async def coverat_command(
     # Add the pending order
     order = {
         "user_id": interaction.user.id,
+        "channel_id": interaction.channel_id,  # Add this line
         "type": "cover",
         "ticker": ticker.upper(),
         "shares": shares,
