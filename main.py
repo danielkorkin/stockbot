@@ -1024,6 +1024,7 @@ async def calculate_portfolio_value(
     price_info = {}
     crypto_value = 0.0
     short_value = 0.0
+    short_profit = 0.0
 
     # Calculate stock portfolio value
     for ticker, shares in portfolio.items():
@@ -1050,20 +1051,52 @@ async def calculate_portfolio_value(
                     "total_value": value,
                 }
 
-    # Calculate short positions value based on current price and original entry price
+    # Calculate short positions value and profit/loss
     if short_positions:
         for ticker, shares in short_positions.items():
             info = await get_stock_info(ticker)
             if info and info["price"] > 0:
+                # Get the original short entry price from transactions
+                entry_price = None
+                async for tx in bot.user_collection.find(
+                    {"short_positions": {"$exists": True}},
+                    {
+                        "transactions": {
+                            "$elemMatch": {"type": "short", "ticker": ticker}
+                        }
+                    },
+                ):
+                    if "transactions" in tx and tx["transactions"]:
+                        entry_price = tx["transactions"][0]["price"]
+                        break
+
+                if entry_price is None:
+                    entry_price = info["price"]  # Fallback if no transaction found
+
                 current_value = info["price"] * shares
-                short_value += current_value
+                profit_loss = (entry_price - info["price"]) * shares
+
+                # Add the original shorted value plus any profit
+                total_position_value = (entry_price * shares) + profit_loss
+                short_value += current_value  # Current liability
+                short_profit += profit_loss  # Current profit/loss
+
                 price_info[f"SHORT-{ticker}"] = {
                     "price": info["price"],
+                    "entry_price": entry_price,
                     "market_status": info["market_status"],
                     "total_value": current_value,
+                    "profit_loss": profit_loss,
                 }
 
-    return round(total, 2), price_info, round(crypto_value, 2), round(short_value, 2)
+    # Return total assets, price info, crypto value, short value
+    # Note: short_profit is included in the total assets
+    return (
+        round(total + short_profit, 2),  # Include short profits in total assets
+        price_info,
+        round(crypto_value, 2),
+        round(short_value, 2),  # Current liability value
+    )
 
 
 async def get_top_stocks() -> List[Dict]:  # Change this line
@@ -2510,16 +2543,14 @@ async def leaderboard_command(interaction: discord.Interaction):
                     portfolio_value,
                     _,
                     crypto_value,
-                    short_value,
+                    short_liability,
                 ) = await calculate_portfolio_value(
                     user["portfolio"],
                     user.get("crypto", {}),
-                    user.get("short_positions", {}),  # Include short positions
+                    user.get("short_positions", {}),
                 )
-                # Calculate total value by subtracting short liabilities
-                total_value = (
-                    user["balance"] + portfolio_value + crypto_value - short_value
-                )
+                # Portfolio value now includes short profits, we just subtract current liabilities
+                total_value = user["balance"] + portfolio_value + crypto_value
                 leaderboard.append((member, total_value))
         except discord.NotFound:
             continue
