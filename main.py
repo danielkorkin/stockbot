@@ -829,12 +829,15 @@ async def get_user_data(user_collection, user_id: int):
 
 # Modify calculate_portfolio_value to include crypto
 async def calculate_portfolio_value(
-    portfolio: Dict[str, int], crypto: Dict[str, float] = None
-) -> tuple[float, dict, float]:
-    """Calculate total portfolio value including stocks and crypto"""
+    portfolio: Dict[str, int],
+    crypto: Dict[str, float] = None,
+    short_positions: Dict[str, int] = None,
+) -> tuple[float, dict, float, float]:
+    """Calculate total portfolio value including stocks, crypto, and short positions"""
     total = 0.0
     price_info = {}
     crypto_value = 0.0
+    short_value = 0.0  # Add short value tracking
 
     # Calculate stock portfolio value
     for ticker, shares in portfolio.items():
@@ -861,7 +864,20 @@ async def calculate_portfolio_value(
                     "total_value": value,
                 }
 
-    return round(total, 2), price_info, round(crypto_value, 2)
+    # Calculate short positions value
+    if short_positions:
+        for ticker, shares in short_positions.items():
+            info = await get_stock_info(ticker)
+            if info and info["price"] > 0:
+                value = info["price"] * shares
+                short_value += value
+                price_info[f"SHORT-{ticker}"] = {
+                    "price": info["price"],
+                    "market_status": info["market_status"],
+                    "total_value": value,
+                }
+
+    return round(total, 2), price_info, round(crypto_value, 2), round(short_value, 2)
 
 
 async def get_top_stocks() -> List[Dict]:  # Change this line
@@ -2160,11 +2176,19 @@ async def leaderboard_command(interaction: discord.Interaction):
             member = await interaction.guild.fetch_member(user["_id"])
             if member:
                 # Get detailed portfolio value with real-time prices
-                portfolio_value, _, crypto_value = await calculate_portfolio_value(
+                (
+                    portfolio_value,
+                    _,
+                    crypto_value,
+                    short_value,
+                ) = await calculate_portfolio_value(
                     user["portfolio"],
                     user.get("crypto", {}),
+                    user.get("short_positions", {}),
                 )
-                total_value = user["balance"] + portfolio_value + crypto_value
+                total_value = (
+                    user["balance"] + portfolio_value + crypto_value - short_value
+                )
                 leaderboard.append((member, total_value))
         except discord.NotFound:
             continue
@@ -2998,10 +3022,17 @@ async def balance_command(
     balance = round(user_data["balance"], 2)
 
     # Get detailed portfolio values
-    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
-        user_data["portfolio"], user_data.get("crypto", {})
+    (
+        portfolio_value,
+        price_info,
+        crypto_value,
+        short_value,
+    ) = await calculate_portfolio_value(
+        user_data["portfolio"],
+        user_data.get("crypto", {}),
+        user_data.get("short_positions", {}),
     )
-    total_value = round(balance + portfolio_value + crypto_value, 2)
+    total_value = round(balance + portfolio_value + crypto_value - short_value, 2)
 
     embed = discord.Embed(
         title=f"Balance Sheet - {target_user.display_name}", color=discord.Color.green()
@@ -3013,6 +3044,7 @@ async def balance_command(
     embed.add_field(
         name="Crypto Portfolio", value=format_crypto_price(crypto_value), inline=True
     )
+    embed.add_field(name="Short Liabilities", value=f"${short_value:,.2f}", inline=True)
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
 
     # Add timestamp to show when values were last updated
@@ -3123,7 +3155,11 @@ async def portfolio_command(
     target_user = user or interaction.user
     user_data = await get_user_data(bot.user_collection, target_user.id)
 
-    if not user_data["portfolio"] and not user_data.get("crypto", {}):
+    if (
+        not user_data["portfolio"]
+        and not user_data.get("crypto", {})
+        and not user_data.get("short_positions", {})
+    ):
         message = (
             "Your portfolio is empty."
             if user is None
@@ -3132,8 +3168,15 @@ async def portfolio_command(
         await interaction.response.send_message(message, ephemeral=True)
         return
 
-    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
-        user_data["portfolio"], user_data.get("crypto", {})
+    (
+        portfolio_value,
+        price_info,
+        crypto_value,
+        short_value,
+    ) = await calculate_portfolio_value(
+        user_data["portfolio"],
+        user_data.get("crypto", {}),
+        user_data.get("short_positions", {}),
     )
 
     # Combine stocks and crypto into one list for pagination
@@ -3163,6 +3206,18 @@ async def portfolio_command(
                 }
             )
 
+    # Add short positions
+    for ticker, shares in user_data.get("short_positions", {}).items():
+        if f"SHORT-{ticker}" in price_info:
+            portfolio_items.append(
+                {
+                    "type": "short",
+                    "ticker": ticker,
+                    "amount": shares,
+                    "price_info": price_info[f"SHORT-{ticker}"],
+                }
+            )
+
     def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
         embed = discord.Embed(
             title=f"Portfolio - {target_user.display_name}", color=discord.Color.blue()
@@ -3173,30 +3228,41 @@ async def portfolio_command(
             value = item["price_info"]["total_value"]
             page_total += value
 
-            if item["type"] == "stock":
+            if item["type"] == "short":
                 embed.add_field(
-                    name=f"Stock: {item['ticker']}",
+                    name=f"Short: {item['ticker']}",
                     value=f"{item['amount']} shares @ ${item['price_info']['price']:,.2f} each\n"
-                    f"Value: ${value:,.2f}",
+                    f"Liability: ${value:,.2f}",
                     inline=False,
                 )
-            else:  # crypto
-                embed.add_field(
-                    name=f"Crypto: {item['ticker']}",
-                    value=f"{item['amount']} tokens @ {format_crypto_price(item['price_info']['price'])} each\n"
-                    f"Value: {format_crypto_price(value)}",
-                    inline=False,
-                )
+            else:
+                if item["type"] == "stock":
+                    embed.add_field(
+                        name=f"Stock: {item['ticker']}",
+                        value=f"{item['amount']} shares @ ${item['price_info']['price']:,.2f} each\n"
+                        f"Value: ${value:,.2f}",
+                        inline=False,
+                    )
+                else:  # crypto
+                    embed.add_field(
+                        name=f"Crypto: {item['ticker']}",
+                        value=f"{item['amount']} tokens @ {format_crypto_price(item['price_info']['price'])} each\n"
+                        f"Value: {format_crypto_price(value)}",
+                        inline=False,
+                    )
 
         total_assets = portfolio_value + crypto_value
+        total_liabilities = short_value
+        net_worth = user_data["balance"] + total_assets - total_liabilities
+
         embed.add_field(
             name="Portfolio Summary",
             value=f"Page Total: {format_crypto_price(page_total)}\n"
-            f"Stocks Value: ${portfolio_value:,.2f}\n"
+            f"Stock Value: ${portfolio_value:,.2f}\n"
             f"Crypto Value: {format_crypto_price(crypto_value)}\n"
-            f"Total Assets: {format_crypto_price(total_assets)}\n"
+            f"Short Liabilities: ${short_value:,.2f}\n"
             f"Cash Balance: ${user_data['balance']:,.2f}\n"
-            f"Net Worth: ${(total_assets + user_data['balance']):,.2f}",
+            f"Net Worth: ${net_worth:,.2f}",
             inline=False,
         )
 
@@ -3219,8 +3285,15 @@ async def sell_all_command(interaction: discord.Interaction):
         return
 
     # Calculate current values and prepare portfolio details
-    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
-        user_data["portfolio"], user_data.get("crypto", {})
+    (
+        portfolio_value,
+        price_info,
+        crypto_value,
+        short_value,
+    ) = await calculate_portfolio_value(
+        user_data["portfolio"],
+        user_data.get("crypto", {}),
+        user_data.get("short_positions", {}),
     )
 
     total_value = portfolio_value + crypto_value
