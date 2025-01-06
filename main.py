@@ -1023,7 +1023,7 @@ async def calculate_portfolio_value(
     total = 0.0
     price_info = {}
     crypto_value = 0.0
-    short_value = 0.0  # Add short value tracking
+    short_value = 0.0
 
     # Calculate stock portfolio value
     for ticker, shares in portfolio.items():
@@ -1050,17 +1050,17 @@ async def calculate_portfolio_value(
                     "total_value": value,
                 }
 
-    # Calculate short positions value
+    # Calculate short positions value based on current price and original entry price
     if short_positions:
         for ticker, shares in short_positions.items():
             info = await get_stock_info(ticker)
             if info and info["price"] > 0:
-                value = info["price"] * shares
-                short_value += value
+                current_value = info["price"] * shares
+                short_value += current_value
                 price_info[f"SHORT-{ticker}"] = {
                     "price": info["price"],
                     "market_status": info["market_status"],
-                    "total_value": value,
+                    "total_value": current_value,
                 }
 
     return round(total, 2), price_info, round(crypto_value, 2), round(short_value, 2)
@@ -2505,7 +2505,7 @@ async def leaderboard_command(interaction: discord.Interaction):
         try:
             member = await interaction.guild.fetch_member(user["_id"])
             if member:
-                # Get detailed portfolio value with real-time prices
+                # Get detailed portfolio value with real-time prices including shorts
                 (
                     portfolio_value,
                     _,
@@ -2514,8 +2514,9 @@ async def leaderboard_command(interaction: discord.Interaction):
                 ) = await calculate_portfolio_value(
                     user["portfolio"],
                     user.get("crypto", {}),
-                    user.get("short_positions", {}),
+                    user.get("short_positions", {}),  # Include short positions
                 )
+                # Calculate total value by subtracting short liabilities
                 total_value = (
                     user["balance"] + portfolio_value + crypto_value - short_value
                 )
