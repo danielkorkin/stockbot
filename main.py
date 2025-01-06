@@ -812,12 +812,18 @@ async def get_user_data(user_collection, user_id: int):
             "balance": INITIAL_BALANCE,
             "portfolio": {},
             "crypto": {},  # Add crypto portfolio
+            "short_positions": {},  # Add short positions
             "transactions": [],
         }
         await user_collection.insert_one(user_data)
     elif "crypto" not in user_data:  # Add crypto field if missing
         user_data["crypto"] = {}
         await user_collection.update_one({"_id": user_id}, {"$set": {"crypto": {}}})
+    elif "short_positions" not in user_data:  # Add short_positions field if missing
+        user_data["short_positions"] = {}
+        await user_collection.update_one(
+            {"_id": user_id}, {"$set": {"short_positions": {}}}
+        )
     return user_data
 
 
@@ -1979,6 +1985,166 @@ async def stock_today_command(interaction: discord.Interaction):
     )
 
     await interaction.followup.send(embed=embed)
+
+
+@stock_group.command(name="short", description="Short sell shares of a stock")
+@app_commands.describe(ticker="Ticker symbol", shares="Number of shares to short")
+async def stock_short_command(
+    interaction: discord.Interaction, ticker: str, shares: int
+):
+    """Short sell shares of a stock"""
+    if shares <= 0:
+        await interaction.response.send_message(
+            "Please enter a positive number of shares.", ephemeral=True
+        )
+        return
+
+    price = await get_stock_price(ticker.upper())
+    if not price:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    # Calculate margin requirement (50% of total position value)
+    total_value = price * shares
+    margin_required = total_value * 0.5
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    if user_data["balance"] < margin_required:
+        await interaction.response.send_message(
+            f"Insufficient funds. Shorting {shares} shares requires ${margin_required:,.2f} in margin.",
+            ephemeral=True,
+        )
+        return
+
+    # Update user's balance and record short position
+    new_balance = user_data["balance"] - margin_required
+    short_positions = user_data.get("short_positions", {})
+    short_positions[ticker.upper()] = short_positions.get(ticker.upper(), 0) + shares
+
+    transaction = {
+        "type": "short",
+        "ticker": ticker.upper(),
+        "shares": shares,
+        "price": price,
+        "total": total_value,
+        "margin": margin_required,
+        "timestamp": datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "short_positions": short_positions},
+            "$push": {"transactions": transaction},
+        },
+    )
+
+    embed = discord.Embed(title="Short Position Opened", color=discord.Color.red())
+    embed.add_field(name="Stock", value=ticker.upper(), inline=True)
+    embed.add_field(name="Shares Shorted", value=str(shares), inline=True)
+    embed.add_field(name="Entry Price", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Position Value", value=f"${total_value:,.2f}", inline=True)
+    embed.add_field(
+        name="Margin Required", value=f"${margin_required:,.2f}", inline=True
+    )
+    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@stock_group.command(name="cover", description="Cover a short position")
+@app_commands.describe(ticker="Ticker symbol", shares="Number of shares to cover")
+async def stock_cover_command(
+    interaction: discord.Interaction, ticker: str, shares: int
+):
+    """Cover shares from a short position"""
+    if shares <= 0:
+        await interaction.response.send_message(
+            "Please enter a positive number of shares.", ephemeral=True
+        )
+        return
+
+    price = await get_stock_price(ticker.upper())
+    if not price:
+        await interaction.response.send_message(
+            "Invalid ticker symbol.", ephemeral=True
+        )
+        return
+
+    user_data = await get_user_data(bot.user_collection, interaction.user.id)
+    short_positions = user_data.get("short_positions", {})
+
+    if (
+        ticker.upper() not in short_positions
+        or short_positions[ticker.upper()] < shares
+    ):
+        await interaction.response.send_message(
+            "You don't have enough shares shorted to cover.", ephemeral=True
+        )
+        return
+
+    # Calculate profit/loss and return margin
+    previous_transaction = next(
+        (
+            t
+            for t in reversed(user_data["transactions"])
+            if t["type"] == "short" and t["ticker"] == ticker.upper()
+        ),
+        None,
+    )
+
+    if not previous_transaction:
+        await interaction.response.send_message(
+            "Error finding original short position.", ephemeral=True
+        )
+        return
+
+    entry_price = previous_transaction["price"]
+    margin_return = (shares / previous_transaction["shares"]) * previous_transaction[
+        "margin"
+    ]
+    profit_loss = (entry_price - price) * shares
+
+    # Update user's balance and short positions
+    new_balance = user_data["balance"] + margin_return + profit_loss
+    short_positions[ticker.upper()] -= shares
+    if short_positions[ticker.upper()] == 0:
+        del short_positions[ticker.upper()]
+
+    transaction = {
+        "type": "cover",
+        "ticker": ticker.upper(),
+        "shares": shares,
+        "price": price,
+        "entry_price": entry_price,
+        "profit_loss": profit_loss,
+        "margin_returned": margin_return,
+        "timestamp": datetime.utcnow(),
+    }
+
+    await bot.user_collection.update_one(
+        {"_id": interaction.user.id},
+        {
+            "$set": {"balance": new_balance, "short_positions": short_positions},
+            "$push": {"transactions": transaction},
+        },
+    )
+
+    embed = discord.Embed(
+        title="Short Position Covered",
+        color=discord.Color.green() if profit_loss >= 0 else discord.Color.red(),
+    )
+    embed.add_field(name="Stock", value=ticker.upper(), inline=True)
+    embed.add_field(name="Shares Covered", value=str(shares), inline=True)
+    embed.add_field(name="Exit Price", value=f"${price:,.2f}", inline=True)
+    embed.add_field(name="Entry Price", value=f"${entry_price:,.2f}", inline=True)
+    embed.add_field(name="Profit/Loss", value=f"${profit_loss:,.2f}", inline=True)
+    embed.add_field(name="Margin Returned", value=f"${margin_return:,.2f}", inline=True)
+    embed.add_field(name="New Balance", value=f"${new_balance:,.2f}", inline=True)
+
+    await interaction.response.send_message(embed=embed)
 
 
 bot = StockBot()
