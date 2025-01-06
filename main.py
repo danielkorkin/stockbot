@@ -1056,6 +1056,8 @@ async def calculate_portfolio_value(
         for ticker, shares in short_positions.items():
             info = await get_stock_info(ticker)
             if info and info["price"] > 0:
+                current_price = info["price"]
+
                 # Get the original short entry price from transactions
                 entry_price = None
                 async for tx in bot.user_collection.find(
@@ -1071,31 +1073,37 @@ async def calculate_portfolio_value(
                         break
 
                 if entry_price is None:
-                    entry_price = info["price"]  # Fallback if no transaction found
+                    entry_price = current_price  # Fallback if no transaction found
 
-                current_value = info["price"] * shares
-                profit_loss = (entry_price - info["price"]) * shares
+                # Calculate current position value and profit/loss
+                original_borrowed_value = entry_price * shares  # What was borrowed
+                current_liability = current_price * shares  # What must be repaid
+                position_profit = (
+                    original_borrowed_value - current_liability
+                )  # Profit from price difference
 
-                # Add the original shorted value plus any profit
-                total_position_value = (entry_price * shares) + profit_loss
-                short_value += current_value  # Current liability
-                short_profit += profit_loss  # Current profit/loss
+                short_value += (
+                    original_borrowed_value  # Add original borrowed value to total
+                )
+                short_profit += position_profit  # Add profit/loss from price movement
 
                 price_info[f"SHORT-{ticker}"] = {
-                    "price": info["price"],
+                    "price": current_price,
                     "entry_price": entry_price,
                     "market_status": info["market_status"],
-                    "total_value": current_value,
-                    "profit_loss": profit_loss,
+                    "total_value": original_borrowed_value,
+                    "current_liability": current_liability,
+                    "profit_loss": position_profit,
                 }
 
-    # Return total assets, price info, crypto value, short value
-    # Note: short_profit is included in the total assets
+    # Return total value (including original short value and profits), price info, crypto value, short value
     return (
-        round(total + short_profit, 2),  # Include short profits in total assets
+        round(
+            total + short_value + short_profit, 2
+        ),  # Total includes short positions and their profits
         price_info,
         round(crypto_value, 2),
-        round(short_value, 2),  # Current liability value
+        round(short_value, 2),  # Original borrowed value
     )
 
 
@@ -2543,7 +2551,7 @@ async def leaderboard_command(interaction: discord.Interaction):
                     portfolio_value,
                     _,
                     crypto_value,
-                    short_liability,
+                    short_value,
                 ) = await calculate_portfolio_value(
                     user["portfolio"],
                     user.get("crypto", {}),
@@ -3378,7 +3386,7 @@ async def history_command(
 async def balance_command(
     interaction: discord.Interaction, user: discord.Member = None
 ):
-    """Show user's balance including crypto holdings"""
+    """Show user's balance including crypto holdings and short positions"""
     target_user = user or interaction.user
     user_data = await get_user_data(bot.user_collection, target_user.id)
     balance = round(user_data["balance"], 2)
@@ -3394,7 +3402,13 @@ async def balance_command(
         user_data.get("crypto", {}),
         user_data.get("short_positions", {}),
     )
-    total_value = round(balance + portfolio_value + crypto_value - short_value, 2)
+
+    # Calculate short position profits
+    short_profits = sum(
+        info["profit_loss"]
+        for key, info in price_info.items()
+        if key.startswith("SHORT-") and "profit_loss" in info
+    )
 
     embed = discord.Embed(
         title=f"Balance Sheet - {target_user.display_name}", color=discord.Color.green()
@@ -3406,14 +3420,15 @@ async def balance_command(
     embed.add_field(
         name="Crypto Portfolio", value=format_crypto_price(crypto_value), inline=True
     )
-    embed.add_field(name="Short Liabilities", value=f"${short_value:,.2f}", inline=True)
+    embed.add_field(name="Short Positions", value=f"${short_value:,.2f}", inline=True)
+    embed.add_field(name="Short Profits", value=f"${short_profits:,.2f}", inline=True)
+
+    total_value = balance + portfolio_value + crypto_value + short_profits
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
 
-    # Add timestamp to show when values were last updated
     embed.set_footer(
         text=f"Values updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
-
     await interaction.response.send_message(embed=embed)
 
 
