@@ -333,6 +333,39 @@ async def get_user_pending_orders(bot, user_id: int) -> List[Dict]:
         return []
 
 
+# Add after the other helper functions
+async def get_top_cryptos() -> List[Dict]:
+    """Get top 20 cryptocurrencies by volume"""
+    try:
+        # Get market data for all supported cryptocurrencies
+        market_data = COINGECKO.get_coins_markets(
+            vs_currency="usd",
+            order="volume_desc",  # Sort by volume
+            per_page=20,  # Get top 20
+            sparkline=False,
+            price_change_percentage="24h",
+        )
+
+        # Format the data
+        cryptos = []
+        for crypto in market_data:
+            cryptos.append(
+                {
+                    "symbol": crypto["symbol"].upper(),
+                    "name": crypto["name"],
+                    "price": crypto["current_price"],
+                    "market_cap": crypto["market_cap"],
+                    "volume": crypto["total_volume"],
+                    "change_24h": crypto["price_change_percentage_24h"] or 0,
+                }
+            )
+
+        return cryptos
+    except Exception as e:
+        print(f"Error getting top cryptos: {e}")
+        return []
+
+
 class PaginatorView(discord.ui.View):
     def __init__(
         self,
@@ -2678,6 +2711,49 @@ async def crypto_lookup_command(interaction: discord.Interaction, ticker: str):
         )
 
     await interaction.followup.send(embed=embed)  # Change to followup
+
+
+@crypto_group.command(name="top", description="Show top 20 cryptocurrencies by volume")
+async def crypto_top_command(interaction: discord.Interaction):
+    """Show top cryptocurrencies with pagination"""
+    await interaction.response.defer()
+
+    cryptos = await get_top_cryptos()
+    if not cryptos:
+        await interaction.followup.send(
+            "Unable to fetch cryptocurrency data.", ephemeral=True
+        )
+        return
+
+    def embed_factory(page_idx: int, total_pages: int, subset: list) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Top Cryptocurrencies by Volume (Page {page_idx + 1}/{total_pages})",
+            color=discord.Color.blue(),
+        )
+
+        for i, crypto in enumerate(subset, start=page_idx * 5 + 1):
+            change_emoji = "🟢" if crypto["change_24h"] >= 0 else "🔴"
+            volume_b = crypto["volume"] / 1_000_000_000  # Convert to billions
+            market_cap_b = crypto["market_cap"] / 1_000_000_000  # Convert to billions
+
+            embed.add_field(
+                name=f"#{i}. {crypto['name']} ({crypto['symbol']})",
+                value=(
+                    f"Price: {format_crypto_price(crypto['price'])}\n"
+                    f"24h Volume: ${volume_b:.2f}B\n"
+                    f"Market Cap: ${market_cap_b:.2f}B\n"
+                    f"{change_emoji} 24h Change: {crypto['change_24h']:+.2f}%"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(
+            text=f"Data provided by CoinGecko • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        return embed
+
+    view = PaginatorView(cryptos, 5, embed_factory, interaction.user.id)
+    await view.send_first_page(interaction.followup, is_followup=True)
 
 
 @bot.tree.command(name="history", description="Show your trading history")
