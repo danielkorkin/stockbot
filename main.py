@@ -3477,18 +3477,53 @@ class SellAllConfirmModal(discord.ui.Modal, title="Confirm Sell All"):
                 }
             )
 
+        # Add cover transactions for short positions
+        for ticker, shares in self.user_data.get("short_positions", {}).items():
+            price = (await get_stock_price(ticker)) or 0
+            # Find original short transaction
+            original_short = next(
+                (
+                    t
+                    for t in reversed(self.user_data["transactions"])
+                    if t["type"] == "short" and t["ticker"] == ticker
+                ),
+                None,
+            )
+            if original_short:
+                margin_return = (shares / original_short["shares"]) * original_short[
+                    "margin"
+                ]
+                profit_loss = (original_short["price"] - price) * shares
+                transactions.append(
+                    {
+                        "type": "cover",
+                        "ticker": ticker,
+                        "shares": shares,
+                        "price": price,
+                        "entry_price": original_short["price"],
+                        "profit_loss": profit_loss,
+                        "margin_returned": margin_return,
+                        "timestamp": datetime.utcnow(),
+                    }
+                )
+
         # Update database
         await bot.user_collection.update_one(
             {"_id": interaction.user.id},
             {
-                "$set": {"balance": new_balance, "portfolio": {}, "crypto": {}},
+                "$set": {
+                    "balance": new_balance,
+                    "portfolio": {},
+                    "crypto": {},
+                    "short_positions": {},  # Clear short positions
+                },
                 "$push": {"transactions": {"$each": transactions}},
             },
         )
 
         embed = discord.Embed(
             title="Portfolio Liquidated",
-            description="All stocks and cryptocurrencies have been sold.",
+            description="All positions have been closed.",
             color=discord.Color.green(),
         )
         embed.add_field(
@@ -3658,11 +3693,7 @@ async def sell_all_command(interaction: discord.Interaction):
         return
 
     # Calculate current values and prepare portfolio details
-    (
-        portfolio_value,
-        price_info,
-        crypto_value,
-    ) = await calculate_portfolio_value(
+    portfolio_value, price_info, crypto_value = await calculate_portfolio_value(
         user_data["portfolio"],
         user_data.get("crypto", {}),
         user_data.get("short_positions", {}),
@@ -3692,9 +3723,22 @@ async def sell_all_command(interaction: discord.Interaction):
                 f"Total Value: ${price_info[key]['total_value']:,.2f}\n"
             )
 
+    # Add short position details
+    for ticker, shares in user_data.get("short_positions", {}).items():
+        key = f"SHORT-{ticker}"
+        if key in price_info:
+            info = price_info[key]
+            details.append(
+                f"Short: {ticker}\n"
+                f"Shares: {shares}\n"
+                f"Current Price: ${info['price']:,.2f}\n"
+                f"Original Value: ${info['original_value']:,.2f}\n"
+                f"Profit/Loss: ${info['profit_loss']:,.2f}\n"
+            )
+
     embed = discord.Embed(
         title="⚠️ Confirm Sell All Assets",
-        description="You are about to sell all your stocks and cryptocurrencies.",
+        description="You are about to sell all your stocks, cryptocurrencies, and close all short positions.",
         color=discord.Color.yellow(),
     )
 
@@ -3768,11 +3812,16 @@ class BankruptcyConfirmModal(discord.ui.Modal, title="Confirm Bankruptcy"):
             "new_balance": INITIAL_BALANCE,
         }
 
-        # Reset user's account
+        # Reset user's account and clear all positions
         await bot.user_collection.update_one(
             {"_id": interaction.user.id},
             {
-                "$set": {"balance": INITIAL_BALANCE, "portfolio": {}, "crypto": {}},
+                "$set": {
+                    "balance": INITIAL_BALANCE,
+                    "portfolio": {},
+                    "crypto": {},
+                    "short_positions": {},  # Clear short positions
+                },
                 "$push": {"transactions": transaction},
             },
         )
