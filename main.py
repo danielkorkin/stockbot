@@ -2556,13 +2556,20 @@ async def leaderboard_command(interaction: discord.Interaction):
                     _,
                     crypto_value,
                     short_value,
+                    short_profit,
                 ) = await calculate_portfolio_value(
                     user["portfolio"],
                     user.get("crypto", {}),
                     user.get("short_positions", {}),
                 )
-                # Portfolio value now includes short profits, we just subtract current liabilities
-                total_value = user["balance"] + portfolio_value + crypto_value
+
+                # Calculate net worth correctly
+                total_value = (
+                    user["balance"]  # Cash balance
+                    + portfolio_value  # Full stock value (includes shorts)
+                    + crypto_value  # Crypto value
+                    + short_profit  # Add profits or subtract losses from shorts
+                )
                 leaderboard.append((member, total_value))
         except discord.NotFound:
             continue
@@ -3416,7 +3423,7 @@ async def balance_command(
     embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
     embed.add_field(
         name="Stock Portfolio",
-        value=f"${portfolio_value - short_value - short_profit:,.2f}",
+        value=f"${portfolio_value:,.2f}",  # Remove the subtraction of short_value and short_profit
         inline=True,
     )
     embed.add_field(name="Crypto Portfolio", value=f"${crypto_value:,.2f}", inline=True)
@@ -3443,7 +3450,15 @@ async def balance_command(
             )
 
     # Calculate and display total net worth
-    total_value = balance + portfolio_value - short_value + crypto_value
+    # Add all positive values and subtract losses from shorts if any
+    total_value = (
+        balance  # Cash balance
+        + portfolio_value  # Full stock value
+        + crypto_value  # Crypto value
+        + short_value  # Add short positions value
+        + short_profit  # Add profits or subtract losses
+    )
+
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
 
     embed.set_footer(
@@ -3570,6 +3585,7 @@ async def portfolio_command(
         price_info,
         crypto_value,
         short_value,
+        short_profit,
     ) = await calculate_portfolio_value(
         user_data["portfolio"],
         user_data.get("crypto", {}),
@@ -3622,14 +3638,28 @@ async def portfolio_command(
 
         page_total = 0.0
         for item in subset:
-            value = item["price_info"]["total_value"]
-            page_total += value
+            if item["type"] == "short":
+                # For shorts, only add the profit/loss to the page total
+                profit_loss = item["price_info"].get("profit_loss", 0)
+                page_total += profit_loss
+            else:
+                # For stocks and crypto, add their full value
+                value = item["price_info"]["total_value"]
+                page_total += value
 
             if item["type"] == "short":
+                profit_loss = item["price_info"].get("profit_loss", 0)
+                profit_str = (
+                    f"(Profit: ${profit_loss:,.2f})"
+                    if profit_loss >= 0
+                    else f"(Loss: ${-profit_loss:,.2f})"
+                )
                 embed.add_field(
                     name=f"Short: {item['ticker']}",
                     value=f"{item['amount']} shares @ ${item['price_info']['price']:,.2f} each\n"
-                    f"Liability: ${value:,.2f}",
+                    f"Original Value: ${item['price_info']['original_value']:,.2f}\n"
+                    f"Current Liability: ${item['price_info']['current_liability']:,.2f}\n"
+                    f"{profit_str}",
                     inline=False,
                 )
             else:
@@ -3648,16 +3678,22 @@ async def portfolio_command(
                         inline=False,
                     )
 
-        total_assets = portfolio_value + crypto_value
-        total_liabilities = short_value
-        net_worth = user_data["balance"] + total_assets - total_liabilities
+        # Calculate net worth correctly:
+        # Cash + Stocks + Crypto + Short Profits (or - Short Losses)
+        net_worth = (
+            user_data["balance"]  # Cash balance
+            + (portfolio_value - short_value)  # Stock value minus short positions
+            + crypto_value  # Crypto value
+            + short_profit  # Add profits or subtract losses from shorts
+        )
 
         embed.add_field(
             name="Portfolio Summary",
-            value=f"Page Total: {format_crypto_price(page_total)}\n"
-            f"Stock Value: ${portfolio_value:,.2f}\n"
+            value=f"Page Total: ${page_total:,.2f}\n"
+            f"Stock Value: ${portfolio_value - short_value:,.2f}\n"
             f"Crypto Value: {format_crypto_price(crypto_value)}\n"
-            f"Short Liabilities: ${short_value:,.2f}\n"
+            f"Short Positions: ${short_value:,.2f}\n"
+            f"Short Profit/Loss: ${short_profit:,.2f}\n"
             f"Cash Balance: ${user_data['balance']:,.2f}\n"
             f"Net Worth: ${net_worth:,.2f}",
             inline=False,
