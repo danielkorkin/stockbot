@@ -2073,17 +2073,25 @@ async def get_major_indices() -> Dict:
         results = {}
         for symbol, name in indices.items():
             ticker = yf.Ticker(symbol)
-            info = ticker.info
-            price = info.get("regularMarketPrice", 0)
-            prev_close = info.get("previousClose", 0)
-            if price and prev_close:
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100
-                results[name] = {
-                    "price": price,
-                    "change": change,
-                    "change_pct": change_pct,
-                }
+            history = ticker.history(period="1d")
+
+            if not history.empty:
+                current = history["Close"].iloc[-1]
+                prev_close = ticker.info.get("previousClose", history["Open"].iloc[0])
+
+                if current and prev_close:
+                    change = current - prev_close
+                    change_pct = (change / prev_close) * 100
+                    results[name] = {
+                        "price": current,
+                        "change": change,
+                        "change_pct": change_pct,
+                        "prev_close": prev_close,
+                    }
+                    print(
+                        f"Got {name} data: Price=${current:.2f}, Change=${change:.2f} ({change_pct:.2f}%)"
+                    )
+
         return results
     except Exception as e:
         print(f"Error fetching indices: {e}")
@@ -2091,34 +2099,92 @@ async def get_major_indices() -> Dict:
 
 
 async def get_top_movers(limit: int = 5) -> Dict[str, List]:
-    """Get top gainers and losers for the day"""
+    """Get real top gainers and losers for the day"""
     try:
-        stocks = await get_top_stocks()
-        if not stocks:
-            return {"gainers": [], "losers": []}
+        # Use a list of major stocks for better performance
+        major_stocks = [
+            "AAPL",
+            "MSFT",
+            "GOOGL",
+            "AMZN",
+            "META",
+            "NVDA",
+            "TSLA",
+            "JPM",
+            "V",
+            "WMT",
+            "UNH",
+            "JNJ",
+            "XOM",
+            "BAC",
+            "PG",
+            "MA",
+            "HD",
+            "CVX",
+            "MRK",
+            "KO",
+            "PEP",
+            "ABBV",
+            "LLY",
+            "AVGO",
+            "COST",
+            "DIS",
+            "CSCO",
+            "PFE",
+            "TMO",
+            "MCD",
+            "ACN",
+            "ABT",
+            "DHR",
+            "NEE",
+            "NKE",
+            "PM",
+            "T",
+            "MS",
+            "INTC",
+            "UPS",
+        ]
 
-        # Get current prices and calculate daily changes
-        movers = []
-        for stock in stocks:
-            ticker = stock["ticker"]
-            info = await get_stock_info(ticker)
-            if info:
-                price = info["price"]
-                prev_close = info.get("previous_close", price)
-                if prev_close:
-                    change_pct = ((price - prev_close) / prev_close) * 100
-                    movers.append(
-                        {
-                            "ticker": ticker,
-                            "name": info["name"],
-                            "price": price,
+        movers_data = []
+
+        # Process stocks in parallel using asyncio
+        async def process_stock(symbol):
+            try:
+                stock = yf.Ticker(symbol)
+                info = stock.info
+                history = stock.history(period="1d")
+
+                if not history.empty:
+                    current_price = history["Close"].iloc[-1]
+                    prev_close = info.get("previousClose", history["Open"].iloc[0])
+
+                    if current_price and prev_close:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100
+                        return {
+                            "ticker": symbol,
+                            "name": info.get("shortName", symbol),
+                            "price": current_price,
                             "change_pct": change_pct,
+                            "change": current_price - prev_close,
                         }
-                    )
+            except Exception as e:
+                print(f"Error processing {symbol}: {e}")
+            return None
 
-        # Sort and get top gainers/losers
-        movers.sort(key=lambda x: x["change_pct"], reverse=True)
-        return {"gainers": movers[:limit], "losers": movers[-limit:][::-1]}
+        # Create tasks for all stocks
+        tasks = [process_stock(symbol) for symbol in major_stocks]
+        results = await asyncio.gather(*tasks)
+
+        # Filter out None results and sort
+        movers_data = [r for r in results if r is not None]
+        movers_data.sort(key=lambda x: x["change_pct"], reverse=True)
+
+        return {
+            "gainers": movers_data[:limit],
+            "losers": movers_data[-limit:][
+                ::-1
+            ],  # Reverse the last 5 for biggest losers
+        }
     except Exception as e:
         print(f"Error getting top movers: {e}")
         return {"gainers": [], "losers": []}
@@ -2140,63 +2206,57 @@ async def stock_today_command(interaction: discord.Interaction):
         timestamp=datetime.utcnow(),
     )
 
-    # If it's weekend, only show market hours
-    if "Weekend" in market_hours["status"]:
-        embed.add_field(
-            name="Trading Hours (ET)",
-            value=f"Pre-market: {market_hours['pre_market']}\n"
-            f"Regular: {market_hours['regular']}\n"
-            f"After-hours: {market_hours['after_hours']}",
-            inline=False,
-        )
-        await interaction.followup.send(embed=embed)
-        return
+    # If it's a weekday, get market data regardless of market hours
+    if "Weekend" not in market_hours["status"]:
+        indices = await get_major_indices()
+        movers = await get_top_movers(5)
 
-    # Get market data for weekdays
-    indices = await get_major_indices()
-    movers = await get_top_movers(5)
+        # Add market performance section if we have data
+        if indices:
+            market_summary = []
+            for name, data in indices.items():
+                change = data["change"]
+                pct = data["change_pct"]
+                emoji = "🟢" if change >= 0 else "🔴"
 
-    # Add market performance section if we have data
-    sp500_data = indices.get("S&P 500", {})
-    dow_data = indices.get("Dow Jones", {})
-    nasdaq_data = indices.get("NASDAQ", {})
+                summary = (
+                    f"{emoji} **{name}**: {data['price']:,.2f}\n"
+                    f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)"
+                )
+                market_summary.append(summary)
 
-    if sp500_data or dow_data or nasdaq_data:
-        market_summary = ""
+            if market_summary:
+                embed.add_field(
+                    name="Market Performance",
+                    value="\n".join(market_summary),
+                    inline=False,
+                )
 
-        if sp500_data:
-            change = sp500_data["change"]
-            pct = sp500_data["change_pct"]
-            emoji = "🟢" if change >= 0 else "🔴"
-            market_summary += (
-                f"{emoji} **S&P 500**: {sp500_data['price']:,.2f}\n"
-                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
-            )
-
-        if dow_data:
-            change = dow_data["change"]
-            pct = dow_data["change_pct"]
-            emoji = "🟢" if change >= 0 else "🔴"
-            market_summary += (
-                f"{emoji} **Dow Jones**: {dow_data['price']:,.2f}\n"
-                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
-            )
-
-        if nasdaq_data:
-            change = nasdaq_data["change"]
-            pct = nasdaq_data["change_pct"]
-            emoji = "🟢" if change >= 0 else "🔴"
-            market_summary += (
-                f"{emoji} **NASDAQ**: {nasdaq_data['price']:,.2f}\n"
-                f"    Change: {'+' if change >= 0 else ''}{change:,.2f} points ({pct:+.2f}%)\n"
-            )
-
-        if market_summary:
+        # Add gainers section
+        if movers["gainers"]:
+            gainers_text = []
+            for stock in movers["gainers"]:
+                gainers_text.append(
+                    f"**{stock['ticker']}** ({stock['name']}): "
+                    f"+{stock['change_pct']:.2f}% (${stock['change']:+,.2f})"
+                )
             embed.add_field(
-                name="Market Performance", value=market_summary, inline=False
+                name="Top Gainers", value="\n".join(gainers_text), inline=False
             )
 
-    # Add trading hours field
+        # Add losers section
+        if movers["losers"]:
+            losers_text = []
+            for stock in movers["losers"]:
+                losers_text.append(
+                    f"**{stock['ticker']}** ({stock['name']}): "
+                    f"{stock['change_pct']:.2f}% (${stock['change']:+,.2f})"
+                )
+            embed.add_field(
+                name="Top Losers", value="\n".join(losers_text), inline=False
+            )
+
+    # Always add trading hours
     embed.add_field(
         name="Trading Hours (ET)",
         value=f"Pre-market: {market_hours['pre_market']}\n"
@@ -2204,19 +2264,6 @@ async def stock_today_command(interaction: discord.Interaction):
         f"After-hours: {market_hours['after_hours']}",
         inline=False,
     )
-
-    # Add gainers/losers only on weekdays and if we have data
-    if movers["gainers"]:
-        gainers_text = ""
-        for stock in movers["gainers"]:
-            gainers_text += f"**{stock['ticker']}**: +{stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
-        embed.add_field(name="Top Gainers", value=gainers_text, inline=False)
-
-    if movers["losers"]:
-        losers_text = ""
-        for stock in movers["losers"]:
-            losers_text += f"**{stock['ticker']}**: {stock['change_pct']:.2f}% (${stock['price']:,.2f})\n"
-        embed.add_field(name="Top Losers", value=losers_text, inline=False)
 
     # Add timestamp
     embed.set_footer(
