@@ -1075,35 +1075,39 @@ async def calculate_portfolio_value(
                 if entry_price is None:
                     entry_price = current_price  # Fallback if no transaction found
 
-                # Calculate current position value and profit/loss
-                original_borrowed_value = entry_price * shares  # What was borrowed
-                current_liability = current_price * shares  # What must be repaid
+                # Calculate position values
+                original_borrowed_value = (
+                    entry_price * shares
+                )  # What was borrowed initially
+                current_liability = current_price * shares  # What must be repaid now
                 position_profit = (
                     original_borrowed_value - current_liability
                 )  # Profit from price difference
 
-                short_value += (
-                    original_borrowed_value  # Add original borrowed value to total
-                )
-                short_profit += position_profit  # Add profit/loss from price movement
+                # The total value of a short position includes both the original borrowed amount
+                # and any profit/loss from the price movement
+                total_position_value = original_borrowed_value + position_profit
+
+                short_value += original_borrowed_value
+                short_profit += position_profit
 
                 price_info[f"SHORT-{ticker}"] = {
                     "price": current_price,
                     "entry_price": entry_price,
                     "market_status": info["market_status"],
-                    "total_value": original_borrowed_value,
+                    "original_value": original_borrowed_value,
                     "current_liability": current_liability,
                     "profit_loss": position_profit,
+                    "total_value": total_position_value,
                 }
 
-    # Return total value (including original short value and profits), price info, crypto value, short value
+    # Return total value (including original short value and profits), price info, crypto value, short positions info
     return (
-        round(
-            total + short_value + short_profit, 2
-        ),  # Total includes short positions and their profits
+        total + short_value + short_profit,  # Total portfolio value including shorts
         price_info,
-        round(crypto_value, 2),
-        round(short_value, 2),  # Original borrowed value
+        crypto_value,
+        short_value,  # Original borrowed value
+        short_profit,  # Current profit/loss from shorts
     )
 
 
@@ -3391,39 +3395,55 @@ async def balance_command(
     user_data = await get_user_data(bot.user_collection, target_user.id)
     balance = round(user_data["balance"], 2)
 
-    # Get detailed portfolio values
+    # Get detailed portfolio values with updated short calculations
     (
         portfolio_value,
         price_info,
         crypto_value,
         short_value,
+        short_profit,
     ) = await calculate_portfolio_value(
         user_data["portfolio"],
         user_data.get("crypto", {}),
         user_data.get("short_positions", {}),
     )
 
-    # Calculate short position profits
-    short_profits = sum(
-        info["profit_loss"]
-        for key, info in price_info.items()
-        if key.startswith("SHORT-") and "profit_loss" in info
-    )
-
     embed = discord.Embed(
         title=f"Balance Sheet - {target_user.display_name}", color=discord.Color.green()
     )
+
+    # Regular holdings
     embed.add_field(name="Cash Balance", value=f"${balance:,.2f}", inline=True)
     embed.add_field(
-        name="Stock Portfolio", value=f"${portfolio_value:,.2f}", inline=True
+        name="Stock Portfolio",
+        value=f"${portfolio_value - short_value - short_profit:,.2f}",
+        inline=True,
     )
-    embed.add_field(
-        name="Crypto Portfolio", value=format_crypto_price(crypto_value), inline=True
-    )
-    embed.add_field(name="Short Positions", value=f"${short_value:,.2f}", inline=True)
-    embed.add_field(name="Short Profits", value=f"${short_profits:,.2f}", inline=True)
+    embed.add_field(name="Crypto Portfolio", value=f"${crypto_value:,.2f}", inline=True)
 
-    total_value = balance + portfolio_value + crypto_value + short_profits
+    # Short positions
+    if short_value > 0:
+        embed.add_field(
+            name="Short Positions", value=f"${short_value:,.2f}", inline=True
+        )
+        embed.add_field(
+            name="Short Profit/Loss", value=f"${short_profit:,.2f}", inline=True
+        )
+        if short_profit >= 0:
+            embed.add_field(
+                name="Total Short Value",
+                value=f"${short_value + short_profit:,.2f}",
+                inline=True,
+            )
+        else:
+            embed.add_field(
+                name="Current Short Liability",
+                value=f"${short_value + abs(short_profit):,.2f}",
+                inline=True,
+            )
+
+    # Calculate and display total net worth
+    total_value = balance + portfolio_value - short_value + crypto_value
     embed.add_field(name="Total Net Worth", value=f"${total_value:,.2f}", inline=False)
 
     embed.set_footer(
